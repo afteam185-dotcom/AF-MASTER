@@ -43,7 +43,6 @@ const state = {
   admin: false,
   device: null,
   deviceError: "",
-  adminAvailable: true,
   adminLoginError: "",
   adminLoginRequested: false,
   adminDeviceCount: 0,
@@ -168,16 +167,6 @@ function clearSubscriptions() {
 function listen(key, reference, next, error = fail) {
   unsubscribers.get(key)?.();
   unsubscribers.set(key, onSnapshot(reference, next, error));
-}
-
-function listenAdminAvailability() {
-  listen("availability", doc(db, "public", "adminAvailability"), (snapshot) => {
-    state.adminAvailable = Number(snapshot.data()?.activeSessions || 0) < 3;
-    if (!state.user) render();
-  }, () => {
-    state.adminAvailable = true;
-    if (!state.user) render();
-  });
 }
 
 function listenProfile(uid) {
@@ -393,7 +382,6 @@ onAuthStateChanged(auth, async (user) => {
   state.chatMessages = [];
   if (!user) {
     state.authReady = true;
-    listenAdminAvailability();
     render();
     return;
   }
@@ -434,7 +422,6 @@ onAuthStateChanged(auth, async (user) => {
     state.deviceError = messageFromError(error);
   } finally {
     state.authReady = true;
-    listenAdminAvailability();
     render();
   }
 });
@@ -488,12 +475,12 @@ function loginView() {
           <small>لو كودك القديم يحتوي حروفاً، سجّل دخول Google مرة واحدة للحصول على كود رقمي.</small>
           <button class="button button-primary button-wide" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ التحقق..." : "دخول الطالب"}</button>
         </form>` : ""}
-        ${state.adminAvailable ? `<div class="admin-login">
+        <div class="admin-login">
           <button class="admin-login-button" type="button" data-action="admin-login" ${state.busy ? "disabled" : ""}>
             <span>♢</span><span>${state.busy && state.adminLoginRequested ? "جارٍ التحقق من حساب المشرف..." : "تسجيل دخول المشرف عبر Google"}</span><span class="admin-chevron">←</span>
           </button>
           ${state.adminLoginError ? `<div class="inline-error">${h(state.adminLoginError)}</div>` : ""}
-        </div>` : ""}
+        </div>
         <div class="login-separator"><span>تسجيل آمن وسريع</span></div>
         <div class="login-note"><span>♢</span><span>بيانات حسابك محمية ولا نشاركها مع الآخرين.</span></div>
         <div class="login-footer">بالمتابعة، أنت توافق على استخدام المنصة بشكل مسؤول.</div>
@@ -623,7 +610,7 @@ function dashboardView() {
     <p>${state.admin ? "أدر المحتوى وتابع الطلاب من مكان واحد." : "اختار درس النهاردة وخلي هدفك أقرب."}</p>
     ${state.admin ? "" : `<button class="button button-light" data-nav="learning">ابدأ التعلّم ←</button>`}</div>
     <div class="welcome-art" aria-hidden="true"><div class="art-ring ring-a"></div><div class="art-ring ring-b"></div><div class="art-book">▤</div><div class="art-star star-a">✦</div><div class="art-star star-b">✧</div><div class="art-dot"></div></div><div class="banner-grain"></div></div>
-    <div class="stat-grid">${statCard("▤", "المنصات المتاحة", String(state.courses.length).padStart(2, "0"), state.admin ? "في مكتبة المحتوى" : "جاهزة لتبدأ", "cyan")}${statCard("▧", "إعلانات جديدة", String(state.announcements.length).padStart(2, "0"), "من فريق الإشراف", "purple")}${statCard("⌂", state.admin ? "أجهزة المشرف" : "الصف الدراسي", state.admin ? `${state.adminDeviceCount} / 3` : state.profile.grade.replace(" الثانوي", ""), state.admin ? "أجهزة نشطة" : state.profile.track, "blue")}</div>
+    <div class="stat-grid">${statCard("▤", "المنصات المتاحة", String(state.courses.length).padStart(2, "0"), state.admin ? "في مكتبة المحتوى" : "جاهزة لتبدأ", "cyan")}${statCard("▧", "إعلانات جديدة", String(state.announcements.length).padStart(2, "0"), "من فريق الإشراف", "purple")}${statCard("⌂", state.admin ? "أجهزة المشرف النشطة" : "الصف الدراسي", state.admin ? String(state.adminDeviceCount) : state.profile.grade.replace(" الثانوي", ""), state.admin ? "بلا حد أقصى" : state.profile.track, "blue")}</div>
     ${state.admin ? "" : `${state.warnings.length ? `<section class="panel warning-panel"><div class="panel-heading"><div><span class="eyebrow">تنبيه من الإشراف</span><h2>ملاحظات على حسابك</h2></div></div>${state.warnings.map((warning) => `<article class="warning-row"><b>${h(warning.body)}</b><small>${h(timestampText(warning.createdAt, true))}</small></article>`).join("")}</section>` : ""}
     <div class="dashboard-columns"><section class="panel learning-panel"><div class="panel-heading"><div><span class="eyebrow">مساحة التعلّم</span><h2>منصاتك الدراسية</h2></div><button class="text-button" data-nav="learning">عرض الكل ←</button></div>
     ${preview.length ? `<div class="course-mini-grid">${preview.map(courseCard).join("")}</div>` : emptyState("▤", "لسه مفيش منصات", "سيظهر محتوى صفك هنا بمجرد إضافته من المشرف.")}</section>

@@ -38,7 +38,7 @@ firebase deploy --only firestore,functions
 
 تحتاج Cloud Functions إلى تفعيل خدمات Google Cloud المطلوبة في مشروع `af-masters`، وقد تتطلب خطة Firebase Blaze وربط الفوترة. إذا ظهر `SERVICE_DISABLED`، فعّل **Cloud Functions API** للمشروع ثم أعد أمر النشر.
 
-يتم تسجيل المشرف عبر Google، وتُقبل فقط الحسابات ذات Firebase UID المدرج في `firebase-config.js` و`functions/src/index.ts`. حد الجلسات هو ثلاثة أجهزة إجمالاً لحسابات المشرف المعتمدة؛ أيقونة **تسجيل دخول المشرف** تظهر أسفل زر Google عند توفر جهاز، وتختفي عند امتلاء الأجهزة ثم تعود بعد تسجيل الخروج. تتطلب وظائف Cloud Scheduler حذف الرسائل والإعلانات دورياً خطة Firebase تدعمها.
+يتم تسجيل المشرف عبر Google، وتُقبل فقط الحسابات ذات Firebase UID المدرج في `firebase-config.js` و`functions/src/index.ts`. المشرف غير مقيّد بعدد أجهزة؛ كل جهاز يحصل على جلسة مستقلة ويمكن إنهاؤها بتسجيل الخروج. أيقونة **تسجيل دخول المشرف** تبقى ظاهرة دائماً. تتطلب وظائف Cloud Scheduler حذف الرسائل والإعلانات دورياً خطة Firebase تدعمها.
 
 ## المزايا والحدود
 
