@@ -11,7 +11,13 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/devices/$(request.auth.uid)/sessions/$(request.auth.token.deviceSession)).data.active == true;
     }
     function isAdmin() {
-      return hasCurrentDevice() && request.auth.token.admin == true;
+      return hasCurrentDevice()
+        && request.auth.token.admin == true
+        && request.auth.uid in [
+          'J9BuDGBCXTced8WtkJsjDQUw94g2',
+          'BrequkkRPuRVaLgmlN8i8tMmN7I2',
+          'ePEzd3F1BNXJvwteHU2TqTYshMq2'
+        ];
     }
     function hasActiveProfile() {
       return hasCurrentDevice()
