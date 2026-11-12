@@ -1,0 +1,19 @@
+{
+  "name": "AF MASTER",
+  "short_name": "AF MASTER",
+  "description": "منصتك الذكية للتعلم والمراجعة",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#101723",
+  "theme_color": "#101723",
+  "icons": [
+    {
+      "src": "./logo.jpeg",
+      "sizes": "1024x1024",
+      "type": "image/jpeg",
+      "purpose": "any maskable"
+    }
+  ]
+}

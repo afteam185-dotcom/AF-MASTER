@@ -1,0 +1,97 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+    function hasCurrentDevice() {
+      return signedIn()
+        && request.auth.token.deviceSession is string
+        && exists(/databases/$(database)/documents/devices/$(request.auth.uid)/sessions/$(request.auth.token.deviceSession))
+        && get(/databases/$(database)/documents/devices/$(request.auth.uid)/sessions/$(request.auth.token.deviceSession)).data.active == true;
+    }
+    function isAdmin() {
+      return hasCurrentDevice() && request.auth.token.admin == true;
+    }
+    function hasActiveProfile() {
+      return hasCurrentDevice()
+        && exists(/databases/$(database)/documents/profiles/$(request.auth.uid))
+        && get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.isActive == true;
+    }
+    function hasLearningAccess() {
+      return hasActiveProfile()
+        && get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.referralCount >= 10;
+    }
+    function matchesStudentCourse(course) {
+      return hasLearningAccess()
+        && course.grade == get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.grade
+        && course.track == get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.track;
+    }
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    match /profiles/{uid} {
+      allow read: if isSelf(uid) || isAdmin();
+      allow write: if false;
+      match /referrals/{referralUid} {
+        allow read: if isSelf(uid) || isAdmin();
+        allow write: if false;
+      }
+      match /warnings/{warningId} {
+        allow read: if isSelf(uid) || isAdmin();
+        allow write: if false;
+      }
+    }
+
+    match /courses/{courseId} {
+      allow read: if isAdmin() || matchesStudentCourse(resource.data);
+      allow write: if isAdmin();
+    }
+    match /lessons/{lessonId} {
+      allow read: if isAdmin() || matchesStudentCourse(resource.data);
+      allow write: if isAdmin();
+    }
+
+    match /chatRooms/{roomId} {
+      allow read: if isAdmin()
+        || (roomId == 'students' && hasActiveProfile())
+        || (roomId == 'support_' + request.auth.uid && hasActiveProfile());
+      allow write: if false;
+      match /messages/{messageId} {
+        allow read: if isAdmin()
+          || ((roomId == 'students' || roomId == 'support_' + request.auth.uid)
+            && hasActiveProfile()
+            && (resource.data.expiresAt == null || resource.data.expiresAt > request.time));
+        allow write: if false;
+      }
+    }
+
+    match /announcements/{announcementId} {
+      allow read: if isAdmin() || (hasActiveProfile() && resource.data.expiresAt > request.time);
+      allow write: if isAdmin();
+      match /seen/{uid} {
+        allow read: if isSelf(uid) || isAdmin();
+        allow create: if isSelf(uid) && hasActiveProfile()
+          && request.resource.data.keys().hasOnly(['seenAt']);
+        allow update, delete: if false;
+      }
+    }
+
+    match /devices/{uid}/sessions/{deviceId} {
+      allow read: if isSelf(uid) || isAdmin();
+      allow write: if false;
+    }
+    match /deviceRequests/{requestId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow write: if false;
+    }
+    match /public/adminAvailability {
+      allow read: if true;
+      allow write: if false;
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
