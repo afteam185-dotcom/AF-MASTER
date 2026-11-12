@@ -1,4 +1,4 @@
-const CACHE_NAME = "af-master-shell-v2";
+const CACHE_NAME = "af-master-shell-v3";
 const APP_ROOT = new URL("./", self.location.href);
 const APP_SHELL = [APP_ROOT.href];
 

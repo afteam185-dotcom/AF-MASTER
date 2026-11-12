@@ -31,6 +31,10 @@ const functions = getFunctions(app);
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 const root = document.querySelector("#root");
+const introOverlay = document.querySelector("#intro-overlay");
+const introVideo = document.querySelector("#intro-video");
+const introSoundButton = document.querySelector("#intro-sound");
+let introFallbackTimer;
 const grades = ["الأول الثانوي", "الثاني الثانوي", "الثالث الثانوي"];
 const tracks = ["عربي", "لغات"];
 const state = {
@@ -46,6 +50,8 @@ const state = {
   codeLoginOpen: false,
   codeLoginError: "",
   authReady: false,
+  introVisible: sessionStorage.getItem("af-master-intro-shown") !== "true"
+    && !window.matchMedia("(prefers-reduced-motion: reduce)").matches,
   busy: false,
   error: "",
   notice: "",
@@ -115,6 +121,9 @@ function messageFromError(error) {
   if (code.includes("resource-exhausted")) return message || "تم الوصول إلى الحد المسموح.";
   if (code.includes("permission-denied")) return message || "ليس لديك صلاحية لتنفيذ هذا الإجراء.";
   if (code.includes("unavailable")) return "تعذر الاتصال بالخدمة. تحقق من الإنترنت وحاول مجدداً.";
+  if (code.includes("internal") || message.trim().toUpperCase() === "INTERNAL") {
+    return "خدمة Firebase غير متاحة. تأكد من تفعيل Cloud Functions API ونشر وظائف المشروع.";
+  }
   return message || "حدث خطأ غير متوقع. حاول مرة أخرى.";
 }
 
@@ -128,6 +137,16 @@ function notify(message) {
   state.notice = message;
   state.error = "";
   render();
+}
+
+function finishIntro() {
+  if (!state.introVisible) return;
+  state.introVisible = false;
+  introOverlay.hidden = true;
+  introOverlay.setAttribute("aria-hidden", "true");
+  introVideo.pause();
+  sessionStorage.setItem("af-master-intro-shown", "true");
+  window.clearTimeout(introFallbackTimer);
 }
 
 function timestampText(value, includeTime = false) {
@@ -809,6 +828,7 @@ async function handleSubmit(event) {
         break;
     }
   } catch (error) {
+    console.error(`AF MASTER form submission failed (${form.dataset.form}).`, error);
     if (form.dataset.form === "student-code-login") {
       state.codeLoginError = error?.code?.includes("unauthenticated")
         ? "كود الدخول غير صحيح أو الحساب غير متاح."
@@ -1067,5 +1087,35 @@ if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("./sw.js").catch((error) => console.error("Service worker registration failed.", error));
   });
 }
+
+if (state.introVisible) {
+  introOverlay.hidden = false;
+  introOverlay.setAttribute("aria-hidden", "false");
+  introVideo.addEventListener("ended", finishIntro, { once: true });
+  introVideo.addEventListener("error", finishIntro, { once: true });
+  introFallbackTimer = window.setTimeout(finishIntro, 60_000);
+  introVideo.play().catch((error) => {
+    console.warn("Intro video autoplay was blocked.", error);
+    introVideo.controls = true;
+    introSoundButton.textContent = "تشغيل الفيديو";
+  });
+} else {
+  introOverlay.hidden = true;
+  introOverlay.setAttribute("aria-hidden", "true");
+  introVideo.pause();
+}
+
+document.querySelector("#intro-skip").addEventListener("click", finishIntro);
+introSoundButton.addEventListener("click", () => {
+  if (introVideo.paused) {
+    introVideo.controls = false;
+    introVideo.muted = true;
+    introVideo.play().catch((error) => console.error("Intro video playback failed.", error));
+    introSoundButton.textContent = "تشغيل الصوت";
+    return;
+  }
+  introVideo.muted = !introVideo.muted;
+  introSoundButton.textContent = introVideo.muted ? "تشغيل الصوت" : "كتم الصوت";
+});
 
 render();

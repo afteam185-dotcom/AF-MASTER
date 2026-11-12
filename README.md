@@ -18,7 +18,7 @@ py -m http.server 8000
 2. من **Settings → Pages** اختر **Deploy from a branch**، وحدد الفرع ومجلد **/(root)**.
 3. فعّل **Google** كمزوّد تسجيل دخول، وأضف نطاق GitHub Pages إلى **Firebase Console → Authentication → Settings → Authorized domains**.
 
-لا تنشئ مجلد `dist` ولا تشغّل عملية build للموقع. ملفات النشر المباشر هي `index.html` و`styles.css` و`app.js` و`firebase-config.js` و`logo.jpeg` و`manifest.webmanifest` و`sw.js`.
+لا تنشئ مجلد `dist` ولا تشغّل عملية build للموقع. ملفات النشر المباشر تشمل `index.html` و`styles.css` و`app.js` و`firebase-config.js` و`logo.jpeg` و`manifest.webmanifest` و`sw.js` وفيديو المقدمة `WhatsApp Video 2026-11-12 at 11.29.58 PM.mp4`.
 
 إعداد Firebase للويب داخل `firebase-config.js` إعداد عميل عام وليس مفتاحاً سرياً؛ الحماية الفعلية تعتمد على Authentication وFirestore Security Rules. لا تضف مفاتيح Admin SDK أو كلمات المرور إلى ملفات الويب.
 
@@ -36,11 +36,14 @@ Pop-Location
 firebase deploy --only firestore,functions
 ```
 
+تحتاج Cloud Functions إلى تفعيل خدمات Google Cloud المطلوبة في مشروع `af-masters`، وقد تتطلب خطة Firebase Blaze وربط الفوترة. إذا ظهر `SERVICE_DISABLED`، فعّل **Cloud Functions API** للمشروع ثم أعد أمر النشر.
+
 يتم تسجيل المشرف عبر Google، وتُقبل فقط الحسابات ذات Firebase UID المدرج في `firebase-config.js` و`functions/src/index.ts`. حد الجلسات هو ثلاثة أجهزة إجمالاً لحسابات المشرف المعتمدة؛ أيقونة **تسجيل دخول المشرف** تظهر أسفل زر Google عند توفر جهاز، وتختفي عند امتلاء الأجهزة ثم تعود بعد تسجيل الخروج. تتطلب وظائف Cloud Scheduler حذف الرسائل والإعلانات دورياً خطة Firebase تدعمها.
 
 ## المزايا والحدود
 
 - تسجيل دخول الطلاب بحساب Google، مع ملف يتضمن الاسم والهاتف والصف والمسار.
+- تظهر مقدمة الفيديو مرة في كل جلسة متصفح أثناء تحميل التطبيق؛ بعدها يُعرض حساب الطالب مباشرةً إن كان مسجلاً، أو شاشة الدخول المعتادة. يمكن تخطيها أو تشغيل صوتها.
 - دخول الطالب من الصفحة الرئيسية بكود سري من 14 رقماً؛ الحساب يجب أن يكون مسجلاً مسبقاً. احتفظ بالكود ولا تشاركه. الحسابات القديمة تحصل على كود رقمي عند تسجيل الدخول بـGoogle مرة واحدة.
 - يسمح لكل طالب بجهازين نشطين؛ الجهاز الثالث ينتظر موافقة المشرف، وعند الموافقة تُنهى أقدم جلسة.
 - إضافة المنصات والفصول والدروس والامتحانات من حساب المشرف.
