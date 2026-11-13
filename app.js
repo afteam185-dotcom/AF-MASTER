@@ -3,7 +3,6 @@ import {
   GoogleAuthProvider,
   getAuth,
   onAuthStateChanged,
-  signInWithCustomToken,
   signInWithPopup,
   signOut,
 } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js";
@@ -46,8 +45,6 @@ const state = {
   admin: false,
   device: null,
   deviceError: "",
-  adminLoginError: "",
-  adminLoginRequested: false,
   adminDeviceCount: 0,
   authReady: false,
   introVisible: sessionStorage.getItem("af-master-intro-shown") !== "true",
@@ -76,7 +73,6 @@ const state = {
 };
 
 const unsubscribers = new Map();
-let resolvingAuth = false;
 
 function h(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -118,15 +114,6 @@ function normalizeWhatsAppNumber(value) {
 async function hashWhatsAppNumber(number) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(number));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function getDeviceId() {
-  let id = localStorage.getItem("af-master-device-id");
-  if (!id) {
-    id = crypto.randomUUID();
-    localStorage.setItem("af-master-device-id", id);
-  }
-  return id;
 }
 
 function call(name, data) {
@@ -347,32 +334,7 @@ function listenChat() {
   });
 }
 
-async function establishAdminDevice(user, claims) {
-  const deviceId = getDeviceId();
-  const sessionReference = doc(db, "devices", user.uid, "sessions", deviceId);
-  if (claims.deviceSession === deviceId) {
-    const session = await getDoc(sessionReference);
-    if (session.exists() && session.data().active === true) {
-      state.device = { status: "active" };
-      return;
-    }
-  }
-  const result = await call("registerDevice", {
-    deviceId,
-    label: navigator.userAgent.slice(0, 96),
-  });
-  if (result.token) {
-    state.device = { status: "active" };
-    resolvingAuth = true;
-    await signInWithCustomToken(auth, result.token);
-    resolvingAuth = false;
-  } else {
-    state.device = { status: "active" };
-  }
-}
-
 onAuthStateChanged(auth, async (user) => {
-  if (resolvingAuth) return;
   clearSubscriptions();
   state.user = user;
   state.profile = null;
@@ -391,25 +353,20 @@ onAuthStateChanged(auth, async (user) => {
   render();
   try {
     const token = await user.getIdTokenResult();
-    state.admin = (token.claims.admin === true && adminUids.includes(user.uid))
-      || (adminUids.includes(user.uid) && token.signInProvider === "google.com");
-    if (state.adminLoginRequested && !state.admin) {
-      state.adminLoginRequested = false;
+    const isAdminAccount = adminUids.includes(user.uid);
+    if (isAdminAccount && token.signInProvider !== "google.com") {
       await signOut(auth);
-      state.adminLoginError = "حساب Google هذا غير موجود ضمن حسابات المشرف المعتمدة.";
+      state.error = "انتهت جلسة المشرف القديمة. سجّل الدخول مجدداً من زر Google.";
       return;
     }
-    if (state.admin) state.adminLoginRequested = false;
+    state.admin = isAdminAccount && token.signInProvider === "google.com";
     if (!state.admin) {
       const profile = await getDoc(doc(db, "profiles", user.uid));
       if (profile.exists()) state.profile = profile.data();
     }
     if (state.admin) {
-      await establishAdminDevice(user, token.claims);
-      if (state.device?.status === "active") {
-        listenSharedData();
-        listenDeviceSession(user.uid);
-      }
+      state.device = { status: "active" };
+      listenSharedData();
     } else if (state.profile) {
       state.device = { status: "active" };
       if (state.profile.isActive) {
@@ -424,16 +381,6 @@ onAuthStateChanged(auth, async (user) => {
     render();
   }
 });
-
-function listenDeviceSession(uid) {
-  const deviceId = getDeviceId();
-  listen("currentDevice", doc(db, "devices", uid, "sessions", deviceId), (snapshot) => {
-    if (!snapshot.exists() || snapshot.data().active !== true) {
-      state.deviceError = "تم إنهاء جلسة هذا الجهاز. سجّل الدخول من جديد للمتابعة.";
-      render();
-    }
-  });
-}
 
 function brand() {
   return `<div class="brand"><img src="./logo.jpeg" alt="شعار AF MASTER"><span><b>AF MASTER</b><small>LEARN • GROW • WIN</small></span></div>`;
@@ -463,12 +410,6 @@ function loginView() {
         <button class="google-button" data-action="google-login" ${state.busy ? "disabled" : ""}>
           <span class="google-g">G</span><span>${state.busy ? "جارٍ تسجيل الدخول..." : "المتابعة باستخدام Google"}</span><span>←</span>
         </button>
-        <div class="admin-login">
-          <button class="admin-login-button" type="button" data-action="admin-login" ${state.busy ? "disabled" : ""}>
-            <span>♢</span><span>${state.busy && state.adminLoginRequested ? "جارٍ التحقق من حساب المشرف..." : "تسجيل دخول المشرف عبر Google"}</span><span class="admin-chevron">←</span>
-          </button>
-          ${state.adminLoginError ? `<div class="inline-error">${h(state.adminLoginError)}</div>` : ""}
-        </div>
         <div class="login-separator"><span>تسجيل آمن وسريع</span></div>
         <div class="login-note"><span>♢</span><span>بيانات حسابك محمية ولا نشاركها مع الآخرين.</span></div>
         <div class="login-footer">بالمتابعة، أنت توافق على استخدام المنصة بشكل مسؤول.</div>
@@ -719,7 +660,6 @@ async function handleSubmit(event) {
   const data = currentFormData(form);
   state.busy = true;
   state.error = "";
-  state.adminLoginError = "";
   render();
   try {
     switch (form.dataset.form) {
@@ -889,37 +829,25 @@ async function handleSubmit(event) {
 
 async function logout() {
   try {
-    const user = auth.currentUser;
-    const token = user ? await user.getIdTokenResult() : null;
-    if (token?.claims.deviceSession) await call("logoutDevice", { deviceId: getDeviceId() });
+    await signOut(auth);
   } catch (error) {
-    state.error = messageFromError(error);
+    fail(error);
+    return;
   }
-  await signOut(auth);
   state.device = null;
   state.deviceError = "";
-  state.adminLoginRequested = false;
   state.modal = "";
   state.nav = "home";
 }
 
-async function loginWithGoogle(asAdmin = false) {
+async function loginWithGoogle() {
   state.busy = true;
   state.error = "";
-  if (asAdmin) {
-    state.adminLoginRequested = true;
-    state.adminLoginError = "";
-  }
   render();
   try {
     await signInWithPopup(auth, googleProvider);
   } catch (error) {
-    if (asAdmin) {
-      state.adminLoginRequested = false;
-      state.adminLoginError = messageFromError(error);
-    } else {
-      fail(error);
-    }
+    fail(error);
   } finally {
     state.busy = false;
     render();
@@ -973,9 +901,6 @@ async function clickAction(action, target, originalTarget) {
   switch (action) {
     case "google-login":
       await loginWithGoogle();
-      break;
-    case "admin-login":
-      await loginWithGoogle(true);
       break;
     case "logout": await logout(); break;
     case "dismiss": state.error = ""; state.notice = ""; render(); break;

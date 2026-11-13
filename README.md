@@ -32,7 +32,7 @@ firebase use YOUR_FIREBASE_PROJECT_ID
 firebase deploy --only firestore:rules
 ```
 
-إنشاء ملف الطالب وتحديث الصف والمسار يتمان مباشرةً عبر Firestore بعد تسجيل Google، ولا يحتاجان Cloud Functions. تظل Cloud Functions مطلوبة لتسجيل أجهزة المشرف وميزات أخرى مثل إدارة المحتوى والمراسلة والإشراف. لنشرها:
+إنشاء ملف الطالب وتحديث الصف والمسار يتمان مباشرةً عبر Firestore بعد تسجيل Google، ولا يحتاجان Cloud Functions. ما زالت بعض الميزات الأخرى تستخدم الدوال، مثل المحادثات والإعلانات والتحذيرات. لنشر هذه الدوال عند الحاجة:
 
 ```powershell
 Push-Location functions
@@ -44,7 +44,7 @@ firebase deploy --only firestore,functions
 
 تحتاج Cloud Functions إلى تفعيل خدمات Google Cloud المطلوبة في مشروع `af-masters`، وقد تتطلب خطة Firebase Blaze وربط الفوترة. إذا ظهر `SERVICE_DISABLED`، فعّل **Cloud Functions API** للمشروع ثم أعد أمر النشر.
 
-يتم تسجيل المشرف عبر Google، وتُقبل فقط الحسابات ذات Firebase UID المدرج في `firebase-config.js` و`functions/src/index.ts`. المشرف غير مقيّد بعدد أجهزة؛ كل جهاز يحصل على جلسة مستقلة ويمكن إنهاؤها بتسجيل الخروج. أيقونة **تسجيل دخول المشرف** تبقى ظاهرة دائماً. تتطلب وظائف Cloud Scheduler حذف الرسائل والإعلانات دورياً خطة Firebase تدعمها.
+يسجل المشرف من زر **المتابعة باستخدام Google** نفسه؛ تمنح قواعد Firestore صلاحية الإدارة فقط لمعرّفات UID المعتمدة في `firebase-config.js` و`firestore.rules`. دخول المشرف لا يحتاج تسجيل جهاز أو Cloud Function، ولا يفرض حداً لعدد الأجهزة. تظل Cloud Functions مستخدمة لعمليات أخرى مثل المحادثات والإعلانات والتحذيرات.
 
 ## المزايا والحدود
 

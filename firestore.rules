@@ -4,15 +4,9 @@ service cloud.firestore {
     function signedIn() {
       return request.auth != null;
     }
-    function hasCurrentDevice() {
-      return signedIn()
-        && request.auth.token.deviceSession is string
-        && exists(/databases/$(database)/documents/devices/$(request.auth.uid)/sessions/$(request.auth.token.deviceSession))
-        && get(/databases/$(database)/documents/devices/$(request.auth.uid)/sessions/$(request.auth.token.deviceSession)).data.active == true;
-    }
     function isAdmin() {
-      return hasCurrentDevice()
-        && request.auth.token.admin == true
+      return signedIn()
+        && request.auth.token.firebase.sign_in_provider == 'google.com'
         && request.auth.uid in [
           'J9BuDGBCXTced8WtkJsjDQUw94g2',
           'BrequkkRPuRVaLgmlN8i8tMmN7I2',
