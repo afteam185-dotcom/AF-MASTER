@@ -67,6 +67,8 @@ const state = {
   supportTarget: "",
   search: "",
   referralCode: new URLSearchParams(location.search).get("ref") || "",
+  whatsappShareDraft: null,
+  whatsappShareOpened: false,
   installPrompt: null,
   installed: false,
   modal: "",
@@ -100,6 +102,22 @@ function normalizeStudentName(value) {
 function createStudentCode() {
   const bytes = crypto.getRandomValues(new Uint8Array(4));
   return `AF${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
+}
+
+function normalizeWhatsAppNumber(value) {
+  let number = latinDigits(value).replace(/\D/g, "");
+  if (number.startsWith("00")) number = number.slice(2);
+  if (/^01\d{9}$/.test(number)) number = `20${number.slice(1)}`;
+  else if (/^1\d{9}$/.test(number)) number = `20${number}`;
+  if (!/^\d{8,15}$/.test(number)) {
+    throw new Error("أدخل رقم واتساب صحيحاً مع مفتاح الدولة.");
+  }
+  return number;
+}
+
+async function hashWhatsAppNumber(number) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(number));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function getDeviceId() {
@@ -181,7 +199,7 @@ function timestampText(value, includeTime = false) {
 }
 
 function remainingReferrals() {
-  return Math.max(10 - Number(state.profile?.referralCount || 0), 0);
+  return Math.max(10 - Number(state.profile?.whatsappShareCount || 0), 0);
 }
 
 function clearSubscriptions() {
@@ -217,7 +235,7 @@ function listenWarnings(uid) {
 
 function listenSharedData() {
   if (!state.admin && !state.profile) return;
-  const canReadCourses = state.admin || Number(state.profile.referralCount || 0) >= 10;
+  const canReadCourses = state.admin || Number(state.profile.whatsappShareCount || 0) >= 10;
   if (!canReadCourses) {
     state.courses = [];
     unsubscribers.get("courses")?.();
@@ -567,13 +585,12 @@ function emptyState(icon, title, body, action = "") {
 }
 
 function progressBlock() {
-  const referrals = Math.min(Number(state.profile?.referralCount || 0), 10);
-  return `<div class="referral-progress"><div class="progress-label"><span>الإحالات المؤكدة</span><b>${referrals} <small>/ 10</small></b></div><div class="progress-track"><span style="width:${referrals * 10}%"></span></div></div>`;
+  const shares = Math.min(Number(state.profile?.whatsappShareCount || 0), 10);
+  return `<div class="referral-progress"><div class="progress-label"><span>أرقام واتساب المختلفة</span><b>${shares} <small>/ 10</small></b></div><div class="progress-track"><span style="width:${shares * 10}%"></span></div></div>`;
 }
 
 function dashboardView() {
   const firstName = displayName().split(" ")[0];
-  const referrals = Number(state.profile?.referralCount || 0);
   const preview = state.courses.slice(0, 2);
   return `<div class="dashboard-page"><div class="welcome-banner"><div class="welcome-content"><span class="eyebrow"><span class="online-dot"></span> منصتك التعليمية في مكان واحد</span>
     <h1>${state.admin ? "أهلاً بك في لوحة الإشراف" : `أهلاً يا ${h(firstName)}،<br>جاهز لخطوتك الجاية؟`}</h1>
@@ -584,7 +601,7 @@ function dashboardView() {
     ${state.admin ? "" : `${state.warnings.length ? `<section class="panel warning-panel"><div class="panel-heading"><div><span class="eyebrow">تنبيه من الإشراف</span><h2>ملاحظات على حسابك</h2></div></div>${state.warnings.map((warning) => `<article class="warning-row"><b>${h(warning.body)}</b><small>${h(timestampText(warning.createdAt, true))}</small></article>`).join("")}</section>` : ""}
     <div class="dashboard-columns"><section class="panel learning-panel"><div class="panel-heading"><div><span class="eyebrow">مساحة التعلّم</span><h2>منصاتك الدراسية</h2></div><button class="text-button" data-nav="learning">عرض الكل ←</button></div>
     ${preview.length ? `<div class="course-mini-grid">${preview.map(courseCard).join("")}</div>` : emptyState("▤", "لسه مفيش منصات", "سيظهر محتوى صفك هنا بمجرد إضافته من المشرف.")}</section>
-    <section class="panel referral-panel"><div class="referral-top"><div class="referral-icon">♧</div><span class="pill">دعوة الأصدقاء</span></div><h2>تعلّموا مع بعض!</h2><p>شارك رابط دعوتك مع أصدقائك. تُحتسب الدعوة بعد تسجيل حساب جديد.</p>${progressBlock()}<button class="button button-outline button-wide" data-action="share">شارك رابط الدعوة</button><small class="referral-hint">لا نتحقق من إرسال رسالة واتساب؛ تحتسب الإحالات لحسابات جديدة فقط.</small></section></div>`}
+    <section class="panel referral-panel"><div class="referral-top"><div class="referral-icon">♧</div><span class="pill">شارك عبر واتساب</span></div><h2>ساعد أصحابك يعرفوا المنصة</h2><p>أرسل الرسالة إلى 10 أرقام واتساب مختلفة. مش مطلوب منهم يسجلوا أو يعملوا حساب.</p>${progressBlock()}<button class="button button-outline button-wide" data-action="share" ${remainingReferrals() ? "" : "disabled"}>${remainingReferrals() ? "أرسل دعوة واتساب" : "اكتمل المطلوب ✓"}</button><small class="referral-hint">بنحتسب الرقم مرة واحدة لكل حساب بعد تأكيدك إرسال الرسالة. واتساب لا يرسل لنا إثباتاً بالتسليم.</small></section></div>`}
     ${state.announcements.length ? `<section class="panel announcement-preview"><div class="panel-heading"><div><span class="eyebrow">آخر التحديثات</span><h2>رسائل المشرف</h2></div><span class="pill">${state.announcements.length} جديد</span></div><div class="announcement-list">${state.announcements.slice(0, 2).map((announcement) => `<article class="announcement-row"><span class="announcement-symbol">▧</span><div><b>${h(announcement.title)}</b><p>${h(announcement.body)}</p></div><span class="read-check">✓✓</span></article>`).join("")}</div></section>` : ""}
     ${state.installPrompt ? `<div class="install-banner"><span>▣</span><div><b>خلّي AF MASTER أقرب ليك</b><span>ثبّت المنصة على جهازك وافتحها بسهولة.</span></div><button class="button button-light" data-action="install">تثبيت ←</button></div>` : ""}${state.installed ? `<div class="installed-note">✓ تم تثبيت AF MASTER على جهازك.</div>` : ""}
   </div>`;
@@ -599,9 +616,9 @@ function chapterGroups() {
 }
 
 function learningView() {
-  if (!state.admin && Number(state.profile?.referralCount || 0) < 10) {
-    return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>افتح منصات التعلّم</h1><p>ادعُ أصدقاءك للانضمام إلى AF MASTER.</p></div></div>
-      <section class="unlock-card"><div class="unlock-art">♧</div><span class="eyebrow">معاً نتعلّم أفضل</span><h2>باقي لك ${remainingReferrals()} إحالات مؤكدة</h2><p>تُحتسب الإحالة عندما يسجل صديق جديد بحسابه ورقم هاتفه. لا يمكن للمنصة التحقق من إرسال رسائل واتساب نفسها.</p>${progressBlock()}<button class="button button-primary" data-action="share">شارك رابط الدعوة</button></section></div>`;
+  if (!state.admin && Number(state.profile?.whatsappShareCount || 0) < 10) {
+    return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>افتح منصات التعلّم</h1><p>شارك رسالة المنصة مع أصحابك على واتساب.</p></div></div>
+      <section class="unlock-card"><div class="unlock-art">♧</div><span class="eyebrow">مش لازم أصحابك يسجلوا</span><h2>باقي لك ${remainingReferrals()} أرقام مختلفة</h2><p>أرسل رسالة واتساب لعشرة أشخاص مختلفين، ثم أكد الإرسال هنا. لا يُشترط أن ينشئوا حساباً أو يسجلوا في المنصة.</p>${progressBlock()}<button class="button button-primary" data-action="share">أرسل دعوة واتساب</button><small class="referral-hint">التأكيد يدوي؛ لا يمكن للموقع معرفة ما إذا أُرسلت الرسالة فعلياً.</small></section></div>`;
   }
   if (state.selectedLesson) return lessonView();
   if (state.selectedCourse) {
@@ -664,6 +681,12 @@ function adminView() {
 
 function modalView() {
   if (!state.modal) return "";
+  if (state.modal === "whatsapp-share") {
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>أرسل دعوة واتساب</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">أدخل رقم شخص مختلف. سنجهّز رسالة واتساب، ولا يلزم أن يسجّل الشخص في المنصة.</p><form class="form-grid" data-form="whatsapp-share"><label>رقم واتساب مع مفتاح الدولة<input name="phone" type="tel" inputmode="tel" autocomplete="tel" required placeholder="+20 10 1234 5678 أو 01012345678"></label>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}<button class="button button-primary" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ تجهيز الرسالة..." : "متابعة إلى واتساب ←"}</button></form></section></div>`;
+  }
+  if (state.modal === "whatsapp-share-confirm" && state.whatsappShareDraft) {
+    return `<div class="modal-backdrop"><section class="modal-card"><div class="modal-heading"><h2>أرسل الرسالة ثم أكّد</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">واتساب سيفتح على الرقم الذي أدخلته. أرسل الرسالة هناك، ثم ارجع واضغط تأكيد الإرسال.</p><div class="form-grid"><a class="button button-outline button-wide" href="${h(state.whatsappShareDraft.url)}" target="_blank" rel="noopener noreferrer" data-action="open-whatsapp">فتح محادثة واتساب</a><button class="button button-primary button-wide" data-action="confirm-whatsapp-share" ${!state.whatsappShareOpened || state.busy ? "disabled" : ""}>${state.busy ? "جارٍ تسجيل التأكيد..." : "تم إرسال الرسالة ✓"}</button><button class="text-button" data-action="change-whatsapp-number">إدخال رقم مختلف</button><small class="referral-hint">يُحفظ معرّف مشتق من الرقم لمنع احتسابه مرتين لحسابك، وليس الرقم نفسه. تأكيد الإرسال يدوي ولا يمكن التحقق منه عبر واتساب.</small>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}</div></section></div>`;
+  }
   if (state.modal === "profile") {
     return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>إعدادات الحساب</h2><button class="icon-button" data-action="close-modal">×</button></div>
       ${state.admin ? `<div class="profile-details"><div><span>الحساب</span><b>${h(state.user.email || "دخول آمن للمشرف")}</b></div><div><span>الدور</span><b>مشرف AF MASTER</b></div><button class="button button-outline" data-action="logout">تسجيل الخروج</button></div>` : `<form class="form-grid" data-form="school-info"><p class="muted">كود الدعوة: <b class="code">${h(state.profile.studentCode || "—")}</b></p><small>سجّل الدخول إلى حسابك باستخدام Google.</small><label>الصف الدراسي<select name="grade">${gradeOptions(state.profile.grade)}</select></label><label>المسار<select name="track">${trackOptions(state.profile.track)}</select></label><button class="button button-primary">حفظ التعديلات</button></form>`}</section></div>`;
@@ -746,6 +769,8 @@ async function handleSubmit(event) {
           referralCodeUsed,
           isActive: true,
           referralCount: 0,
+          whatsappShareCount: 0,
+          lastWhatsAppShareId: null,
           createdAt: serverTimestamp(),
         });
         batch.set(doc(db, "phoneNumbers", phone), {
@@ -772,6 +797,22 @@ async function handleSubmit(event) {
         listenProfile(state.user.uid);
         listenSharedData();
         notify("تم إنشاء حسابك بنجاح.");
+        break;
+      }
+      case "whatsapp-share": {
+        const phone = normalizeWhatsAppNumber(data.phone);
+        if (state.profile?.phone && normalizeWhatsAppNumber(state.profile.phone) === phone) {
+          throw new Error("اكتب رقم شخص آخر، وليس رقمك.");
+        }
+        const recipientHash = await hashWhatsAppNumber(phone);
+        const text = `انضم إلى AF MASTER وابدأ التعلم معي! ${location.origin}${location.pathname}?ref=${state.profile?.studentCode || ""}`;
+        state.whatsappShareDraft = {
+          recipientHash,
+          url: `https://wa.me/${phone}?text=${encodeURIComponent(text)}`,
+        };
+        state.whatsappShareOpened = false;
+        state.modal = "whatsapp-share-confirm";
+        state.error = "";
         break;
       }
       case "chat":
@@ -885,16 +926,46 @@ async function loginWithGoogle(asAdmin = false) {
   }
 }
 
-async function shareInvite() {
-  const text = `انضم إلى AF MASTER وابدأ التعلم معي! ${location.origin}${location.pathname}?ref=${state.profile?.studentCode || ""}`;
+async function confirmWhatsAppShare() {
+  if (!state.whatsappShareDraft || !state.whatsappShareOpened || !state.user) return;
+  state.busy = true;
+  state.error = "";
+  render();
   try {
-    if (navigator.share) await navigator.share({ title: "AF MASTER", text });
-    else {
-      await navigator.clipboard.writeText(text);
-      notify("تم نسخ رابط الدعوة. تُحتسب الإحالة بعد تسجيل صديقك بحساب جديد.");
+    const { recipientHash } = state.whatsappShareDraft;
+    const shareRef = doc(db, "profiles", state.user.uid, "whatsappShares", recipientHash);
+    if ((await getDoc(shareRef)).exists()) {
+      throw new Error("تم احتساب هذا الرقم من قبل. أدخل رقم شخص مختلف.");
     }
+    const nextCount = Number(state.profile?.whatsappShareCount || 0) + 1;
+    const batch = writeBatch(db);
+    batch.update(doc(db, "profiles", state.user.uid), {
+      whatsappShareCount: increment(1),
+      lastWhatsAppShareId: recipientHash,
+    });
+    batch.set(shareRef, {
+      recipientHash,
+      createdAt: serverTimestamp(),
+    });
+    await batch.commit();
+    state.profile = {
+      ...state.profile,
+      whatsappShareCount: nextCount,
+      lastWhatsAppShareId: recipientHash,
+    };
+    state.whatsappShareDraft = null;
+    state.whatsappShareOpened = false;
+    state.modal = "";
+    listenSharedData();
+    notify(nextCount >= 10 ? "اكتمل العدد! منصات التعلّم أصبحت متاحة." : `تم تسجيل الإرسال. ${10 - nextCount} أرقام مختلفة متبقية.`);
   } catch (error) {
-    if (error.name !== "AbortError") fail(error);
+    console.error("WhatsApp share confirmation failed.", error);
+    state.error = error?.code === "permission-denied"
+      ? "تعذر تسجيل الرقم؛ ربما احتُسب بالفعل. حدّث الصفحة، وإن استمرت المشكلة فتأكد من نشر قواعد Firestore الجديدة."
+      : messageFromError(error);
+  } finally {
+    state.busy = false;
+    render();
   }
 }
 
@@ -909,11 +980,42 @@ async function clickAction(action, target, originalTarget) {
     case "logout": await logout(); break;
     case "dismiss": state.error = ""; state.notice = ""; render(); break;
     case "profile": state.modal = "profile"; render(); break;
-    case "close-modal": state.modal = ""; render(); break;
-    case "backdrop":
-      if (originalTarget === target) { state.modal = ""; render(); }
+    case "close-modal":
+      state.modal = "";
+      state.whatsappShareDraft = null;
+      state.whatsappShareOpened = false;
+      state.error = "";
+      render();
       break;
-    case "share": await shareInvite(); break;
+    case "backdrop":
+      if (originalTarget === target) {
+        state.modal = "";
+        state.whatsappShareDraft = null;
+        state.whatsappShareOpened = false;
+        state.error = "";
+        render();
+      }
+      break;
+    case "share":
+      if (remainingReferrals() === 0) return;
+      state.modal = "whatsapp-share";
+      state.error = "";
+      render();
+      break;
+    case "open-whatsapp":
+      state.whatsappShareOpened = true;
+      window.setTimeout(render, 250);
+      break;
+    case "confirm-whatsapp-share":
+      await confirmWhatsAppShare();
+      break;
+    case "change-whatsapp-number":
+      state.modal = "whatsapp-share";
+      state.whatsappShareDraft = null;
+      state.whatsappShareOpened = false;
+      state.error = "";
+      render();
+      break;
     case "install":
       if (state.installPrompt) {
         await state.installPrompt.prompt();

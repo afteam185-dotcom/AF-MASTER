@@ -26,7 +26,7 @@ service cloud.firestore {
     }
     function hasLearningAccess() {
       return hasActiveProfile()
-        && get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.referralCount >= 10;
+        && get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.get('whatsappShareCount', 0) >= 10;
     }
     function matchesStudentCourse(course) {
       return hasLearningAccess()
@@ -47,12 +47,12 @@ service cloud.firestore {
         && request.resource.data.keys().hasAll([
           'uid', 'fullName', 'normalizedName', 'email', 'phone', 'grade', 'track',
           'studentCode', 'referredByUid', 'referralCodeUsed', 'isActive',
-          'referralCount', 'createdAt'
+          'referralCount', 'whatsappShareCount', 'lastWhatsAppShareId', 'createdAt'
         ])
         && request.resource.data.keys().hasOnly([
           'uid', 'fullName', 'normalizedName', 'email', 'phone', 'grade', 'track',
           'studentCode', 'referredByUid', 'referralCodeUsed', 'isActive',
-          'referralCount', 'createdAt'
+          'referralCount', 'whatsappShareCount', 'lastWhatsAppShareId', 'createdAt'
         ])
         && request.resource.data.uid == uid
         && request.resource.data.fullName is string
@@ -69,6 +69,8 @@ service cloud.firestore {
         && request.resource.data.studentCode.matches('^AF[A-F0-9]{8}$')
         && request.resource.data.isActive == true
         && request.resource.data.referralCount == 0
+        && request.resource.data.whatsappShareCount == 0
+        && request.resource.data.lastWhatsAppShareId == null
         && request.resource.data.createdAt == request.time
         && existsAfter(/databases/$(database)/documents/phoneNumbers/$(request.resource.data.phone))
         && getAfter(/databases/$(database)/documents/phoneNumbers/$(request.resource.data.phone)).data.uid == uid
@@ -100,6 +102,21 @@ service cloud.firestore {
         && getAfter(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.referralCodeUsed == resource.data.studentCode
         && get(/databases/$(database)/documents/referralCodes/$(resource.data.studentCode)).data.uid == uid;
     }
+    function validWhatsAppShareIncrement(uid) {
+      return isSelf(uid)
+        && resource.data.isActive == true
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'whatsappShareCount', 'lastWhatsAppShareId'
+        ])
+        && request.resource.data.whatsappShareCount == resource.data.get('whatsappShareCount', 0) + 1
+        && request.resource.data.lastWhatsAppShareId is string
+        && request.resource.data.lastWhatsAppShareId.matches('^[a-f0-9]{64}$')
+        && existsAfter(/databases/$(database)/documents/profiles/$(uid)/whatsappShares/$(request.resource.data.lastWhatsAppShareId))
+        && getAfter(/databases/$(database)/documents/profiles/$(uid)/whatsappShares/$(request.resource.data.lastWhatsAppShareId)).data.recipientHash
+          == request.resource.data.lastWhatsAppShareId
+        && getAfter(/databases/$(database)/documents/profiles/$(uid)/whatsappShares/$(request.resource.data.lastWhatsAppShareId)).data.createdAt
+          == request.time;
+    }
 
     match /profiles/{uid} {
       allow read: if isSelf(uid) || isAdmin();
@@ -109,7 +126,8 @@ service cloud.firestore {
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['grade', 'track'])
           && request.resource.data.grade in ['الأول الثانوي', 'الثاني الثانوي', 'الثالث الثانوي']
           && request.resource.data.track in ['عربي', 'لغات'])
-        || validReferralIncrement(uid);
+        || validReferralIncrement(uid)
+        || validWhatsAppShareIncrement(uid);
       allow delete: if false;
       match /referrals/{referralUid} {
         allow read: if isSelf(uid) || isAdmin();
@@ -126,6 +144,19 @@ service cloud.firestore {
       match /warnings/{warningId} {
         allow read: if isSelf(uid) || isAdmin();
         allow write: if false;
+      }
+      match /whatsappShares/{shareId} {
+        allow get: if isSelf(uid) || isAdmin();
+        allow list: if false;
+        allow create: if isSelf(uid)
+          && request.resource.data.keys().hasOnly(['recipientHash', 'createdAt'])
+          && shareId.matches('^[a-f0-9]{64}$')
+          && request.resource.data.recipientHash == shareId
+          && request.resource.data.createdAt == request.time
+          && getAfter(/databases/$(database)/documents/profiles/$(uid)).data.lastWhatsAppShareId == shareId
+          && getAfter(/databases/$(database)/documents/profiles/$(uid)).data.whatsappShareCount
+            == get(/databases/$(database)/documents/profiles/$(uid)).data.get('whatsappShareCount', 0) + 1;
+        allow update, delete: if false;
       }
     }
 
