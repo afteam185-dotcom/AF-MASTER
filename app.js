@@ -1,8 +1,11 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js";
 import {
+  EmailAuthProvider,
   GoogleAuthProvider,
   getAuth,
+  linkWithCredential,
   onAuthStateChanged,
+  signInWithEmailAndPassword,
   signInWithPopup,
   signOut,
 } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js";
@@ -10,26 +13,28 @@ import {
   addDoc,
   collection,
   collectionGroup,
+  deleteDoc,
   doc,
   getDoc,
+  getDocs,
   increment,
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
+  Timestamp,
   updateDoc,
   where,
   writeBatch,
 } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
 import { getFirestore } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
-import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-functions.js";
 import { adminUids, firebaseConfig } from "./firebase-config.js";
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
-const functions = getFunctions(app);
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 const root = document.querySelector("#root");
@@ -46,15 +51,18 @@ const state = {
   device: null,
   deviceError: "",
   adminDeviceCount: 0,
+  studentLoginCode: null,
   authReady: false,
-  introVisible: sessionStorage.getItem("af-master-intro-shown") !== "true",
+  introVisible: true,
   busy: false,
   error: "",
   notice: "",
   nav: "home",
   courses: [],
+  chapters: [],
   lessons: [],
   selectedCourse: null,
+  selectedChapterId: "",
   selectedLesson: null,
   chatMessages: [],
   announcements: [],
@@ -65,14 +73,17 @@ const state = {
   search: "",
   referralCode: new URLSearchParams(location.search).get("ref") || "",
   whatsappShareDraft: null,
-  whatsappShareOpened: false,
   installPrompt: null,
   installed: false,
   modal: "",
+  editingCourseId: null,
+  editingChapterId: null,
   chatText: "",
 };
 
 const unsubscribers = new Map();
+let announcementExpiryTimer = null;
+let chatExpiryTimer = null;
 
 function h(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -100,6 +111,61 @@ function createStudentCode() {
   return `AF${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
 }
 
+function createNumericLoginCode() {
+  const digits = [];
+  while (digits.length < 24) {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    for (const byte of bytes) {
+      if (byte >= 250) continue;
+      digits.push(String(byte % 10));
+      if (digits.length === 24) break;
+    }
+  }
+  return digits.join("");
+}
+
+function loginEmailForCode(code) {
+  return `${code}@${firebaseConfig.projectId}.firebaseapp.com`;
+}
+
+function linkedLoginCode(user) {
+  const provider = user?.providerData?.find((item) => item.providerId === "password");
+  const email = provider?.email || "";
+  const suffix = `@${firebaseConfig.projectId}.firebaseapp.com`;
+  const code = email.endsWith(suffix) ? email.slice(0, -suffix.length) : "";
+  return /^\d{24}$/.test(code) ? code : null;
+}
+
+async function linkNumericLoginCode(user, code) {
+  if (linkedLoginCode(user) === code) return user;
+  if (user.providerData.some((item) => item.providerId === "password")) {
+    throw new Error("هذا الحساب مرتبط بالفعل بطريقة دخول أخرى بكلمة مرور، ولا يمكن استبدالها تلقائياً.");
+  }
+  const credential = EmailAuthProvider.credential(loginEmailForCode(code), code);
+  const result = await linkWithCredential(user, credential);
+  return result.user;
+}
+
+async function saveNumericLoginCode(uid, code) {
+  if (!/^\d{24}$/.test(code)) throw new Error("كود الدخول غير صالح.");
+  const codeRef = doc(db, "profiles", uid, "privateAuth", "login");
+  const existing = await getDoc(codeRef);
+  if (existing.exists() && existing.data().loginCode !== code) {
+    throw new Error("يوجد كود دخول مختلف محفوظ لهذا الحساب.");
+  }
+  if (existing.exists()) return;
+  const batch = writeBatch(db);
+  batch.set(codeRef, {
+    loginCode: code,
+    createdAt: serverTimestamp(),
+  });
+  batch.set(doc(db, "loginCodes", code), {
+    uid,
+    createdAt: serverTimestamp(),
+  });
+  await batch.commit();
+}
+
 function normalizeWhatsAppNumber(value) {
   let number = latinDigits(value).replace(/\D/g, "");
   if (number.startsWith("00")) number = number.slice(2);
@@ -116,13 +182,14 @@ async function hashWhatsAppNumber(number) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function call(name, data) {
-  return httpsCallable(functions, name)(data).then((result) => result.data);
-}
-
 function messageFromError(error) {
   const code = error?.code || "";
   const message = error?.message || "";
+  if (code === "auth/too-many-requests") return "محاولات كثيرة. انتظر قليلاً ثم حاول مرة أخرى.";
+  if (code === "auth/operation-not-allowed") {
+    return "فعّل مزوّد Email/Password في إعدادات Firebase Authentication لتفعيل الدخول بالكود.";
+  }
+  if (code === "auth/requires-recent-login") return "سجّل الدخول إلى Google مجدداً ثم أعد تفعيل كود الدخول.";
   if (code.includes("already-exists")) {
     return message.includes("رقم الهاتف")
       ? "رقم الهاتف مستخدم بالفعل."
@@ -136,6 +203,16 @@ function messageFromError(error) {
     return "حدث خطأ أثناء تنفيذ العملية. حاول مرة أخرى.";
   }
   return message || "حدث خطأ غير متوقع. حاول مرة أخرى.";
+}
+
+function loginCodeSetupError(error) {
+  if (error?.code === "auth/operation-not-allowed") {
+    return "فعّل مزوّد Email/Password في إعدادات Firebase Authentication لتفعيل الدخول بالكود.";
+  }
+  if (error?.code === "permission-denied" || error?.code === "firestore/permission-denied") {
+    return "تعذر حفظ كود الدخول. انشر قواعد Firestore المحدّثة ثم أعد المحاولة.";
+  }
+  return messageFromError(error);
 }
 
 function fail(error) {
@@ -156,7 +233,6 @@ function finishIntro() {
   introOverlay.hidden = true;
   introOverlay.setAttribute("aria-hidden", "true");
   introVideo.pause();
-  sessionStorage.setItem("af-master-intro-shown", "true");
 }
 
 function showIntroStart(message, buttonLabel = "تشغيل المقدمة بالصوت") {
@@ -192,6 +268,10 @@ function remainingReferrals() {
 function clearSubscriptions() {
   for (const unsubscribe of unsubscribers.values()) unsubscribe();
   unsubscribers.clear();
+  window.clearTimeout(announcementExpiryTimer);
+  window.clearTimeout(chatExpiryTimer);
+  announcementExpiryTimer = null;
+  chatExpiryTimer = null;
 }
 
 function listen(key, reference, next, error = fail) {
@@ -203,7 +283,25 @@ function listenProfile(uid) {
   listen("profile", doc(db, "profiles", uid), (snapshot) => {
     state.profile = snapshot.exists() ? snapshot.data() : null;
     if (state.profile && state.device?.status === "active") {
-      listenWarnings(uid);
+      if (state.profile.isActive) {
+        listenWarnings(uid);
+        listenStudentLoginCode(uid);
+        if (state.nav === "chat" || state.nav === "support") listenChat();
+      } else {
+        state.warnings = [];
+        state.chatMessages = [];
+        state.studentLoginCode = null;
+        unsubscribers.get("warnings")?.();
+        unsubscribers.delete("warnings");
+        unsubscribers.get("student-login-code")?.();
+        unsubscribers.delete("student-login-code");
+        for (const key of ["chat0", "chat1"]) {
+          unsubscribers.get(key)?.();
+          unsubscribers.delete(key);
+        }
+        window.clearTimeout(chatExpiryTimer);
+        chatExpiryTimer = null;
+      }
       listenSharedData();
     }
     render();
@@ -220,8 +318,53 @@ function listenWarnings(uid) {
   });
 }
 
+function listenStudentLoginCode(uid) {
+  listen("student-login-code", doc(db, "profiles", uid, "privateAuth", "login"), (snapshot) => {
+    const storedCode = snapshot.exists() ? snapshot.data().loginCode : null;
+    const authCode = linkedLoginCode(state.user);
+    state.studentLoginCode = storedCode || authCode;
+    render();
+    if (!storedCode && authCode) {
+      saveNumericLoginCode(uid, authCode).catch(fail);
+    }
+  });
+}
+
+function listenAnnouncements() {
+  listen("announcements", query(
+    collection(db, "announcements"),
+    where("expiresAt", ">", new Date()),
+    orderBy("expiresAt", "asc"),
+  ), (snapshot) => {
+    state.announcements = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+    window.clearTimeout(announcementExpiryTimer);
+    const nextExpiry = state.announcements
+      .map((announcement) => announcement.expiresAt?.toMillis?.() || 0)
+      .filter((timestamp) => timestamp > Date.now())
+      .sort((a, b) => a - b)[0];
+    if (nextExpiry) {
+      announcementExpiryTimer = window.setTimeout(
+        listenAnnouncements,
+        Math.max(0, nextExpiry - Date.now() + 50),
+      );
+    }
+    if (state.nav === "updates" && !state.admin) markAnnouncementsSeen();
+    render();
+  });
+}
+
 function listenSharedData() {
-  if (!state.admin && !state.profile) return;
+  if (!state.admin && (!state.profile || !state.profile.isActive)) {
+    state.courses = [];
+    state.announcements = [];
+    window.clearTimeout(announcementExpiryTimer);
+    announcementExpiryTimer = null;
+    for (const key of ["courses", "announcements"]) {
+      unsubscribers.get(key)?.();
+      unsubscribers.delete(key);
+    }
+    return;
+  }
   const canReadCourses = state.admin || Number(state.profile.whatsappShareCount || 0) >= 10;
   if (!canReadCourses) {
     state.courses = [];
@@ -237,21 +380,18 @@ function listenSharedData() {
     );
   listen("courses", coursesQuery, (snapshot) => {
     state.courses = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-    if (state.selectedCourse && !state.courses.some((course) => course.id === state.selectedCourse.id)) {
-      state.selectedCourse = null;
+    if (state.selectedCourse) {
+      state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
+      if (!state.selectedCourse) {
+        state.selectedChapterId = "";
+        state.selectedLesson = null;
+        listenLessons(null);
+      }
     }
     render();
   });
   }
-  listen("announcements", query(
-    collection(db, "announcements"),
-    where("expiresAt", ">", new Date()),
-    orderBy("expiresAt", "asc"),
-  ), (snapshot) => {
-    state.announcements = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-    if (state.nav === "updates" && !state.admin) markAnnouncementsSeen();
-    render();
-  });
+  listenAnnouncements();
 
   if (state.admin) {
     listen("students", query(collection(db, "profiles"), orderBy("createdAt", "desc")), (snapshot) => {
@@ -285,32 +425,73 @@ async function markAnnouncementsSeen() {
 
 function listenLessons(course) {
   if (!course) {
+    state.chapters = [];
     state.lessons = [];
-    unsubscribers.get("lessons")?.();
-    unsubscribers.delete("lessons");
+    for (const key of ["chapters", "lessons"]) {
+      unsubscribers.get(key)?.();
+      unsubscribers.delete(key);
+    }
     return;
   }
-  listen("lessons", query(
-    collection(db, "lessons"),
+  state.chapters = [];
+  state.lessons = [];
+  const courseFilters = [
     where("courseId", "==", course.id),
     where("grade", "==", course.grade),
     where("track", "==", course.track),
-  ), (snapshot) => {
-    state.lessons = snapshot.docs
+  ];
+  listen("chapters", query(collection(db, "chapters"), ...courseFilters), (snapshot) => {
+    state.chapters = snapshot.docs
       .map((item) => ({ id: item.id, ...item.data() }))
-      .sort((a, b) => a.chapterNumber - b.chapterNumber);
+      .sort((a, b) => Number(a.number) - Number(b.number)
+        || Number(a.type === "exam") - Number(b.type === "exam"));
+    sortCourseLessons();
+    render();
+  });
+  listen("lessons", query(collection(db, "lessons"), ...courseFilters), (snapshot) => {
+    state.lessons = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+    sortCourseLessons();
     render();
   });
 }
 
+function sortCourseLessons() {
+  const chapterRank = (lesson) => {
+    const linkedIndex = state.chapters.findIndex((chapter) => chapter.id === lesson.chapterId);
+    if (linkedIndex >= 0) return linkedIndex;
+    const number = Number(lesson.chapterNumber || 0);
+    const type = lesson.type === "exam" ? "exam" : "chapter";
+    const matchingIndex = state.chapters.findIndex((chapter) =>
+      Number(chapter.number) === number && chapter.type === type);
+    if (matchingIndex >= 0) return matchingIndex;
+    const chapterIndex = state.chapters.findIndex((chapter) =>
+      Number(chapter.number) === number && chapter.type === "chapter");
+    return chapterIndex >= 0 ? chapterIndex : state.chapters.length + number;
+  };
+  state.lessons.sort((a, b) => {
+    const rankA = chapterRank(a);
+    const rankB = chapterRank(b);
+    if (rankA !== rankB) return rankA - rankB;
+    const createdA = a.createdAt?.toMillis?.() || 0;
+    const createdB = b.createdAt?.toMillis?.() || 0;
+    return createdA - createdB;
+  });
+}
+
 function listenChat() {
-  if (!state.user || (!state.admin && !state.profile)) return;
+  if (!state.user || (!state.admin && !state.profile?.isActive)) return;
   if (state.nav !== "chat" && state.nav !== "support") return;
   const roomId = state.nav === "chat"
     ? "students"
     : `support_${state.admin ? state.supportTarget : state.user.uid}`;
   if (state.nav === "support" && state.admin && !state.supportTarget) {
     state.chatMessages = [];
+    window.clearTimeout(chatExpiryTimer);
+    chatExpiryTimer = null;
+    for (const key of ["chat0", "chat1"]) {
+      unsubscribers.get(key)?.();
+      unsubscribers.delete(key);
+    }
     render();
     return;
   }
@@ -320,6 +501,16 @@ function listenChat() {
     state.chatMessages = items.flat()
       .filter((message, index, list) => list.findIndex((item) => item.id === message.id) === index)
       .sort((a, b) => (a.createdAt?.toMillis() || 0) - (b.createdAt?.toMillis() || 0));
+    window.clearTimeout(chatExpiryTimer);
+    const nextExpiry = state.chatMessages
+      .map((message) => message.expiresAt?.toMillis?.() || 0)
+      .filter((timestamp) => timestamp > Date.now())
+      .sort((a, b) => a - b)[0];
+    if (nextExpiry) {
+      chatExpiryTimer = window.setTimeout(() => {
+        if (state.nav === "chat" || state.nav === "support") listenChat();
+      }, Math.max(0, nextExpiry - Date.now() + 50));
+    }
     render();
   };
   const filters = [
@@ -334,21 +525,113 @@ function listenChat() {
   });
 }
 
+async function writeChatMessage(value) {
+  const text = String(value || "").trim();
+  if (!text || text.length > 2000) throw new Error("اكتب رسالة صالحة.");
+
+  const support = state.nav === "support";
+  const isAdminSender = state.admin;
+  const recipientUid = support
+    ? (isAdminSender ? state.supportTarget : state.user.uid)
+    : "";
+  if (support && isAdminSender && !recipientUid) {
+    throw new Error("حدد حساب الطالب أولاً.");
+  }
+
+  const roomId = support ? `support_${recipientUid}` : "students";
+  const messagesRef = collection(db, "chatRooms", roomId, "messages");
+  const messageRef = doc(messagesRef);
+  const expiresAt = Timestamp.fromDate(new Date(Date.now() + 24 * 60 * 60 * 1000));
+  const message = {
+    senderId: state.user.uid,
+    senderName: isAdminSender ? "مشرف AF MASTER" : state.profile.fullName,
+    text,
+    kind: isAdminSender ? "admin" : "student",
+    createdAt: serverTimestamp(),
+    expiresAt: support && !isAdminSender ? null : expiresAt,
+  };
+
+  if (support && !isAdminSender) {
+    const roomRef = doc(db, "chatRooms", roomId);
+    const systemMessageRef = doc(messagesRef);
+    await runTransaction(db, async (transaction) => {
+      const roomSnapshot = await transaction.get(roomRef);
+      const startNewTurn = !roomSnapshot.exists()
+        || roomSnapshot.data().awaitingAdminReply !== true;
+      transaction.set(roomRef, {
+        roomType: "support",
+        studentUid: state.user.uid,
+        updatedAt: serverTimestamp(),
+        awaitingAdminReply: true,
+      }, { merge: true });
+      transaction.set(messageRef, message);
+      if (startNewTurn) {
+        transaction.set(systemMessageRef, {
+          senderId: "system",
+          senderName: "AF MASTER",
+          text: "تم استلام رسالتك، وسيتم الرد عليك خلال 24 ساعة.",
+          kind: "system",
+          createdAt: serverTimestamp(),
+          expiresAt,
+        });
+      }
+    });
+    return;
+  }
+
+  if (support && isAdminSender) {
+    const [activeSnapshot, pendingSnapshot] = await Promise.all([
+      getDocs(query(messagesRef, where("expiresAt", ">", new Date()))),
+      getDocs(query(messagesRef, where("expiresAt", "==", null))),
+    ]);
+    const priorMessages = new Map();
+    for (const snapshot of [activeSnapshot, pendingSnapshot]) {
+      for (const messageDoc of snapshot.docs) priorMessages.set(messageDoc.id, messageDoc.ref);
+    }
+    const priorRefs = [...priorMessages.values()];
+    for (let offset = 0; offset < priorRefs.length; offset += 400) {
+      const batch = writeBatch(db);
+      for (const messageDocRef of priorRefs.slice(offset, offset + 400)) {
+        batch.update(messageDocRef, { expiresAt });
+      }
+      await batch.commit();
+    }
+    const batch = writeBatch(db);
+    batch.set(doc(db, "chatRooms", roomId), {
+      roomType: "support",
+      studentUid: recipientUid,
+      updatedAt: serverTimestamp(),
+      awaitingAdminReply: false,
+    }, { merge: true });
+    batch.set(messageRef, message);
+    await batch.commit();
+    return;
+  }
+
+  await addDoc(messagesRef, message);
+}
+
 onAuthStateChanged(auth, async (user) => {
   clearSubscriptions();
   state.user = user;
   state.profile = null;
+  state.studentLoginCode = null;
   state.device = null;
   state.deviceError = "";
   state.admin = false;
   state.courses = [];
+  state.chapters = [];
   state.lessons = [];
+  state.selectedCourse = null;
+  state.selectedChapterId = "";
+  state.selectedLesson = null;
   state.chatMessages = [];
   if (!user) {
     state.authReady = true;
     render();
     return;
   }
+  if (state.modal === "code-login") state.modal = "";
   state.authReady = false;
   render();
   try {
@@ -369,10 +652,8 @@ onAuthStateChanged(auth, async (user) => {
       listenSharedData();
     } else if (state.profile) {
       state.device = { status: "active" };
-      if (state.profile.isActive) {
-        listenProfile(user.uid);
-        listenSharedData();
-      }
+      listenProfile(user.uid);
+      listenSharedData();
     }
   } catch (error) {
     state.deviceError = messageFromError(error);
@@ -406,10 +687,11 @@ function loginView() {
       <section class="login-card">
         <div class="login-icon">⌂</div><span class="eyebrow">أهلاً بك في مجتمعنا</span>
         <h2>ابدأ رحلتك</h2><p>سجّل دخولك بحساب Google للوصول إلى منصتك التعليمية.</p>
-        ${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}
+        ${state.error && state.modal !== "code-login" ? `<div class="inline-error">${h(state.error)}</div>` : ""}
         <button class="google-button" data-action="google-login" ${state.busy ? "disabled" : ""}>
           <span class="google-g">G</span><span>${state.busy ? "جارٍ تسجيل الدخول..." : "المتابعة باستخدام Google"}</span><span>←</span>
         </button>
+        <button class="button button-outline button-wide" data-action="code-login">دخول الطالب بالكود الرقمي</button>
         <div class="login-separator"><span>تسجيل آمن وسريع</span></div>
         <div class="login-note"><span>♢</span><span>بيانات حسابك محمية ولا نشاركها مع الآخرين.</span></div>
         <div class="login-footer">بالمتابعة، أنت توافق على استخدام المنصة بشكل مسؤول.</div>
@@ -430,7 +712,7 @@ function registrationView() {
       ${state.referralCode ? `<div class="referral-tag">✓ دعوة صديق مضافة تلقائياً</div>` : ""}
       <button class="button button-primary button-wide" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ إنشاء الحساب..." : "إنشاء حسابي ←"}</button>
     </form>
-    <p class="registration-foot">♢ رقم هاتفك واسمك يُستخدمان لمنع تكرار الحسابات فقط.</p>
+    <p class="registration-foot">♢ رقم هاتفك واسمك يُستخدمان لمنع تكرار الحسابات. سيُنشأ لك كود دخول رقمي طويل احتفظ به بسرية.</p>
   </section></div>`;
 }
 
@@ -487,7 +769,7 @@ function render() {
   if (!state.authReady) {
     root.innerHTML = `<div class="center-screen"><div class="loading-mark"><img src="./logo.jpeg" alt=""><span class="spinner"></span></div></div>`;
   } else if (!state.user) {
-    root.innerHTML = loginView();
+    root.innerHTML = `${loginView()}${modalView()}`;
   } else if (state.deviceError) {
     root.innerHTML = accessView("تعذر تفعيل هذا الجهاز", state.deviceError);
   } else if (state.device?.status === "pending") {
@@ -542,31 +824,61 @@ function dashboardView() {
     ${state.admin ? "" : `${state.warnings.length ? `<section class="panel warning-panel"><div class="panel-heading"><div><span class="eyebrow">تنبيه من الإشراف</span><h2>ملاحظات على حسابك</h2></div></div>${state.warnings.map((warning) => `<article class="warning-row"><b>${h(warning.body)}</b><small>${h(timestampText(warning.createdAt, true))}</small></article>`).join("")}</section>` : ""}
     <div class="dashboard-columns"><section class="panel learning-panel"><div class="panel-heading"><div><span class="eyebrow">مساحة التعلّم</span><h2>منصاتك الدراسية</h2></div><button class="text-button" data-nav="learning">عرض الكل ←</button></div>
     ${preview.length ? `<div class="course-mini-grid">${preview.map(courseCard).join("")}</div>` : emptyState("▤", "لسه مفيش منصات", "سيظهر محتوى صفك هنا بمجرد إضافته من المشرف.")}</section>
-    <section class="panel referral-panel"><div class="referral-top"><div class="referral-icon">♧</div><span class="pill">شارك عبر واتساب</span></div><h2>ساعد أصحابك يعرفوا المنصة</h2><p>أرسل الرسالة إلى 10 أرقام واتساب مختلفة. مش مطلوب منهم يسجلوا أو يعملوا حساب.</p>${progressBlock()}<button class="button button-outline button-wide" data-action="share" ${remainingReferrals() ? "" : "disabled"}>${remainingReferrals() ? "أرسل دعوة واتساب" : "اكتمل المطلوب ✓"}</button><small class="referral-hint">بنحتسب الرقم مرة واحدة لكل حساب بعد تأكيدك إرسال الرسالة. واتساب لا يرسل لنا إثباتاً بالتسليم.</small></section></div>`}
+    <section class="panel referral-panel"><div class="referral-top"><div class="referral-icon">♧</div><span class="pill">شارك عبر واتساب</span></div><h2>ساعد أصحابك يعرفوا المنصة</h2><p>أضف 10 أرقام مختلفة. مش مطلوب من أصحابك يسجلوا أو يعملوا حساب.</p>${progressBlock()}<button class="button button-outline button-wide" data-action="share" ${remainingReferrals() ? "" : "disabled"}>${remainingReferrals() ? "أضف رقم صديق" : "اكتمل المطلوب ✓"}</button><small class="referral-hint">يُحتسب كل رقم صحيح مرة واحدة لحسابك. إرسال الرسالة على واتساب متاح لكنه غير مطلوب.</small></section></div>`}
     ${state.announcements.length ? `<section class="panel announcement-preview"><div class="panel-heading"><div><span class="eyebrow">آخر التحديثات</span><h2>رسائل المشرف</h2></div><span class="pill">${state.announcements.length} جديد</span></div><div class="announcement-list">${state.announcements.slice(0, 2).map((announcement) => `<article class="announcement-row"><span class="announcement-symbol">▧</span><div><b>${h(announcement.title)}</b><p>${h(announcement.body)}</p></div><span class="read-check">✓✓</span></article>`).join("")}</div></section>` : ""}
     ${state.installPrompt ? `<div class="install-banner"><span>▣</span><div><b>خلّي AF MASTER أقرب ليك</b><span>ثبّت المنصة على جهازك وافتحها بسهولة.</span></div><button class="button button-light" data-action="install">تثبيت ←</button></div>` : ""}${state.installed ? `<div class="installed-note">✓ تم تثبيت AF MASTER على جهازك.</div>` : ""}
   </div>`;
 }
 
 function chapterGroups() {
-  const groups = new Map();
+  const groups = state.chapters.map((chapter) => ({
+    ...chapter,
+    number: Number(chapter.number || 0),
+    title: chapter.title || `الفصل ${chapter.number}`,
+    type: chapter.type || "chapter",
+    lessons: [],
+    isLegacy: false,
+  }));
+  const chaptersById = new Map(groups.map((chapter) => [chapter.id, chapter]));
+  const legacyGroups = new Map();
   for (const lesson of state.lessons) {
-    groups.set(lesson.chapterNumber, [...(groups.get(lesson.chapterNumber) || []), lesson]);
+    const number = Number(lesson.chapterNumber || 0);
+    const legacyType = lesson.type === "exam" ? "exam" : "chapter";
+    const linkedChapter = chaptersById.get(lesson.chapterId)
+      || groups.find((chapter) => chapter.number === number && chapter.type === legacyType)
+      || groups.find((chapter) => chapter.number === number && chapter.type === "chapter");
+    if (linkedChapter) {
+      linkedChapter.lessons.push(lesson);
+      continue;
+    }
+    const key = String(number);
+    if (!legacyGroups.has(key)) {
+      legacyGroups.set(key, {
+        id: `legacy:${key}`,
+        number,
+        title: lesson.chapterTitle || `الفصل ${number}`,
+        type: "chapter",
+        lessons: [],
+        isLegacy: true,
+      });
+    }
+    legacyGroups.get(key).lessons.push(lesson);
   }
-  return [...groups.entries()].sort((a, b) => a[0] - b[0]);
+  return [...groups, ...legacyGroups.values()]
+    .sort((a, b) => a.number - b.number || a.title.localeCompare(b.title));
 }
 
 function learningView() {
   if (!state.admin && Number(state.profile?.whatsappShareCount || 0) < 10) {
-    return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>افتح منصات التعلّم</h1><p>شارك رسالة المنصة مع أصحابك على واتساب.</p></div></div>
-      <section class="unlock-card"><div class="unlock-art">♧</div><span class="eyebrow">مش لازم أصحابك يسجلوا</span><h2>باقي لك ${remainingReferrals()} أرقام مختلفة</h2><p>أرسل رسالة واتساب لعشرة أشخاص مختلفين، ثم أكد الإرسال هنا. لا يُشترط أن ينشئوا حساباً أو يسجلوا في المنصة.</p>${progressBlock()}<button class="button button-primary" data-action="share">أرسل دعوة واتساب</button><small class="referral-hint">التأكيد يدوي؛ لا يمكن للموقع معرفة ما إذا أُرسلت الرسالة فعلياً.</small></section></div>`;
+    return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>افتح منصات التعلّم</h1><p>أضف أرقام واتساب مختلفة لفتح المنصات.</p></div></div>
+      <section class="unlock-card"><div class="unlock-art">♧</div><span class="eyebrow">مش لازم أصحابك يسجلوا</span><h2>باقي لك ${remainingReferrals()} أرقام مختلفة</h2><p>أضف أرقام واتساب لعشرة أشخاص مختلفين. يُفتح المحتوى فور إضافة الرقم العاشر؛ لا يُشترط أن يرسل أصدقاؤك أي شيء أو ينشئوا حساباً.</p>${progressBlock()}<button class="button button-primary" data-action="share">أضف رقم صديق</button></section></div>`;
   }
   if (state.selectedLesson) return lessonView();
   if (state.selectedCourse) {
     const groups = chapterGroups();
     return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-courses">كل المنصات</button> ← <b>${h(state.selectedCourse.title)}</b></div>
-      <div class="page-title-row course-title-row"><div><span class="eyebrow">${h(state.selectedCourse.grade)} · ${h(state.selectedCourse.track)}</span><h1>${h(state.selectedCourse.title)}</h1><p>${h(state.selectedCourse.description || "اختار الفصل أو المحتوى اللي حابب تراجعه.")}</p></div>${state.admin ? `<button class="button button-primary" data-action="add-lesson">＋ إضافة درس أو امتحان</button>` : ""}</div>
-      ${groups.length ? `<div class="chapter-list">${groups.map(([number, items]) => `<section class="chapter-card"><div class="chapter-title"><span class="chapter-index">${String(number).padStart(2, "0")}</span><div><span class="eyebrow">الفصل ${number}</span><h2>${h(items[0]?.chapterTitle || `الفصل ${number}`)}</h2></div><span class="chapter-count">${items.length} محتوى</span></div><div class="chapter-lessons">${items.map((lesson, index) => `<button class="lesson-row" data-lesson="${h(lesson.id)}"><span class="lesson-index ${lesson.type === "exam" ? "exam-index" : ""}">${lesson.type === "exam" ? "▣" : String(index + 1).padStart(2, "0")}</span><span class="lesson-row-copy"><b>${h(lesson.title)}</b><small>${lesson.type === "exam" ? "امتحان ومراجعة" : `${lesson.entries?.length || 0} سؤال وإجابة`}</small></span><span>←</span></button>`).join("")}</div></section>`).join("")}</div>` : emptyState("▤", "الفصل ينتظر محتواه", "سيظهر الدرس والامتحان هنا بمجرد إضافتهما.", state.admin ? `<button class="button button-primary" data-action="add-lesson">＋ إضافة درس</button>` : "")}</div>`;
+      <div class="page-title-row course-title-row"><div><span class="eyebrow">${h(state.selectedCourse.grade)} · ${h(state.selectedCourse.track)}</span><h1>${h(state.selectedCourse.title)}</h1><p>${h(state.selectedCourse.description || "اختار الفصل أو المحتوى اللي حابب تراجعه.")}</p></div>${state.admin ? `<div class="course-title-actions"><button class="button button-outline" data-action="edit-course">تعديل المنصة</button><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>` : ""}</div>
+      ${groups.length ? `<div class="chapter-list">${groups.map((chapter, chapterIndex) => `<section class="chapter-card"><div class="chapter-title"><span class="chapter-index">${chapter.type === "exam" ? "E" : String(chapter.number || chapterIndex + 1).padStart(2, "0")}</span><div><span class="eyebrow">${chapter.type === "exam" ? "امتحانات" : `الفصل ${chapter.number || chapterIndex + 1}`}</span><h2>${h(chapter.title)}</h2></div><span class="chapter-count">${chapter.lessons.length} محتوى</span>${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-edit" data-action="edit-chapter" data-chapter="${h(chapter.id)}">تعديل الفصل</button>` : ""}</div><div class="chapter-lessons">${chapter.lessons.map((lesson, index) => `<button class="lesson-row" data-lesson="${h(lesson.id)}"><span class="lesson-index ${lesson.type === "exam" ? "exam-index" : ""}">${lesson.type === "exam" ? "▣" : String(index + 1).padStart(2, "0")}</span><span class="lesson-row-copy"><b>${h(lesson.title)}</b><small>${lesson.type === "exam" ? "امتحان ومراجعة" : `${lesson.entries?.length || 0} سؤال وإجابة`}</small></span><span>←</span></button>`).join("")}${chapter.lessons.length ? "" : `<p class="chapter-empty">لا توجد دروس في هذا الفصل بعد.</p>`}${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-add-lesson" data-action="add-lesson" data-chapter="${h(chapter.id)}">＋ إضافة درس أو امتحان لهذا الفصل</button>` : ""}</div></section>`).join("")}</div>` : emptyState("▤", "لم تُضف فصولاً بعد", "أنشئ فصول المنصة ثم أضف الدروس والامتحانات داخل كل فصل.", state.admin ? `<button class="button button-primary" data-action="add-chapter">＋ إضافة أول فصل</button>` : "")}</div>`;
   }
   return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>اختار منصتك وابدأ</h1><p>محتوى مرتب حسب الصف والمسار الدراسي.</p></div>${state.admin ? `<button class="button button-primary" data-action="add-course">＋ إضافة منصة</button>` : ""}</div>
     ${state.admin ? "" : `<div class="filter-chips"><span class="filter-chip">⌂ ${h(state.profile.grade)}</span><span class="filter-chip">${h(state.profile.track)}</span></div>`}
@@ -576,6 +888,10 @@ function learningView() {
 
 function lessonView() {
   const lesson = state.selectedLesson;
+  const chapter = state.chapters.find((item) => item.id === lesson.chapterId)
+    || state.chapters.find((item) =>
+      Number(item.number) === Number(lesson.chapterNumber)
+      && (item.type === (lesson.type === "exam" ? "exam" : "chapter") || item.type === "chapter"));
   if (lesson.type === "exam" && state.examLessonId !== lesson.id) {
     state.examEntries = [...(lesson.entries || [])];
     for (let index = state.examEntries.length - 1; index > 0; index -= 1) {
@@ -587,7 +903,7 @@ function lessonView() {
   const entries = lesson.type === "exam" ? state.examEntries : (lesson.entries || []);
   const position = state.lessons.findIndex((item) => item.id === lesson.id);
   return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-lessons">${h(state.selectedCourse?.title || "")}</button> ← <b>${h(lesson.title)}</b></div>
-    <div class="lesson-heading"><div class="lesson-symbol">▤</div><div><span class="eyebrow">${lesson.type === "exam" ? "مراجعة واختبار" : `الفصل ${lesson.chapterNumber}`}</span><h1>${h(lesson.title)}</h1></div><span class="pill">${entries.length} سؤال</span></div>
+    <div class="lesson-heading"><div class="lesson-symbol">▤</div><div><span class="eyebrow">${lesson.type === "exam" ? "مراجعة واختبار" : h(chapter?.title || lesson.chapterTitle || `الفصل ${lesson.chapterNumber}`)}</span><h1>${h(lesson.title)}</h1></div><span class="pill">${entries.length} سؤال</span></div>
     ${lesson.type === "exam" ? `<div class="exam-note">✦ قد تظهر الأسئلة بترتيب مختلف في الامتحان. راجع كل إجابة جيداً.</div>` : ""}
     <div class="qa-list">${entries.map((entry, index) => `<article class="qa-card"><div class="qa-number">س${String(index + 1).padStart(2, "0")}</div><div class="qa-body"><h3>${h(entry.question)}</h3><div class="answer-box"><span>الإجابة</span><p>${h(entry.answer)}</p></div></div><button class="copy-button" data-copy="${h(entry.answer)}"><span>▣</span><span>نسخ</span></button></article>`).join("")}</div>
     <div class="lesson-next"><span>✓✓ ${position === state.lessons.length - 1 ? "أنهيت آخر محتوى في هذه المنصة" : "أحسنت! أكملت هذا المحتوى"}</span><button class="button button-primary" data-action="next-lesson">${position === state.lessons.length - 1 ? "إنهاء" : "التالي"} ←</button></div></div>`;
@@ -621,26 +937,57 @@ function adminView() {
 }
 
 function modalView() {
-  if (!state.modal) return "";
-  if (state.modal === "whatsapp-share") {
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>أرسل دعوة واتساب</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">أدخل رقم شخص مختلف. سنجهّز رسالة واتساب، ولا يلزم أن يسجّل الشخص في المنصة.</p><form class="form-grid" data-form="whatsapp-share"><label>رقم واتساب مع مفتاح الدولة<input name="phone" type="tel" inputmode="tel" autocomplete="tel" required placeholder="+20 10 1234 5678 أو 01012345678"></label>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}<button class="button button-primary" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ تجهيز الرسالة..." : "متابعة إلى واتساب ←"}</button></form></section></div>`;
+  if (!state.admin && state.profile?.isActive && !state.profile.whatsappChannelJoined) {
+    return `<div class="modal-backdrop"><section class="modal-card channel-modal" role="dialog" aria-modal="true" aria-labelledby="channel-modal-title">
+      <div class="channel-icon" aria-hidden="true">◉</div>
+      <span class="eyebrow">خليك قريب من AF MASTER</span>
+      <h2 id="channel-modal-title">اشترك في قناة واتساب</h2>
+      <p class="muted">اشترك على القناة عشان يوصلك كل جديد، إحنا مش بنرخم عليك بس عشان تبقى عارف إحنا فين!</p>
+      <a class="button channel-button" href="https://whatsapp.com/channel/0029VbE2SzLJkK776ZAkwG23" target="_blank" rel="noopener noreferrer"><span aria-hidden="true">◉</span> افتح قناة AF MASTER على واتساب</a>
+      ${state.error ? `<div class="inline-error" role="alert">${h(state.error)}</div>` : ""}
+      <button class="button button-primary button-wide" data-action="confirm-channel-subscription" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ حفظ التأكيد..." : "اشتركت، متابعة ←"}</button>
+      <small class="channel-note">بعد التأكيد لن تظهر لك هذه الخطوة مرة أخرى.</small>
+    </section></div>`;
   }
-  if (state.modal === "whatsapp-share-confirm" && state.whatsappShareDraft) {
-    return `<div class="modal-backdrop"><section class="modal-card"><div class="modal-heading"><h2>أرسل الرسالة ثم أكّد</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">واتساب سيفتح على الرقم الذي أدخلته. أرسل الرسالة هناك، ثم ارجع واضغط تأكيد الإرسال.</p><div class="form-grid"><a class="button button-outline button-wide" href="${h(state.whatsappShareDraft.url)}" target="_blank" rel="noopener noreferrer" data-action="open-whatsapp">فتح محادثة واتساب</a><button class="button button-primary button-wide" data-action="confirm-whatsapp-share" ${!state.whatsappShareOpened || state.busy ? "disabled" : ""}>${state.busy ? "جارٍ تسجيل التأكيد..." : "تم إرسال الرسالة ✓"}</button><button class="text-button" data-action="change-whatsapp-number">إدخال رقم مختلف</button><small class="referral-hint">يُحفظ معرّف مشتق من الرقم لمنع احتسابه مرتين لحسابك، وليس الرقم نفسه. تأكيد الإرسال يدوي ولا يمكن التحقق منه عبر واتساب.</small>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}</div></section></div>`;
+  if (!state.modal) return "";
+  if (state.modal === "code-login") {
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>تسجيل الدخول بالكود</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">أدخل كود الدخول الرقمي المكوّن من 24 رقماً.</p><form class="form-grid" data-form="code-login"><label>كود الطالب<input name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9٠-٩۰-۹]{24}" maxlength="24" minlength="24" required dir="ltr" placeholder="••••••••••••••••••••••••"></label>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}<button class="button button-primary" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ التحقق..." : "دخول آمن ←"}</button></form></section></div>`;
+  }
+  if (state.modal === "student-login-code" && state.studentLoginCode) {
+    const activeCode = linkedLoginCode(state.user) === state.studentLoginCode;
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>كود دخولك الرقمي</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${activeCode ? "احتفظ بهذا الكود بسرية؛ يمكن استخدامه وحده للدخول إلى حسابك." : "احفظ الكود، ثم فعّل تسجيل الدخول به. استخدم Google إلى أن يظهر تأكيد التفعيل."}</p><div class="profile-details"><div><span>كود الطالب — 24 رقمًا</span><b class="code" dir="ltr">${h(state.studentLoginCode)}</b></div></div><div class="form-grid"><button type="button" class="button button-outline" data-copy="${h(state.studentLoginCode)}">نسخ الكود</button>${activeCode ? "" : `<button class="button button-primary" data-action="enable-code-login" ${state.busy ? "disabled" : ""}>تفعيل كود الدخول</button>`}</div>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}</section></div>`;
+  }
+  if (state.modal === "whatsapp-share") {
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>أضف رقم صديق</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">أدخل رقم واتساب بصيغة صحيحة ومختلفاً. يُحتسب الرقم فور إضافته؛ إرسال الرسالة أو تسجيل الصديق غير مطلوب.</p><form class="form-grid" data-form="whatsapp-share"><label>رقم واتساب مع مفتاح الدولة<input name="phone" type="tel" inputmode="tel" autocomplete="tel" required placeholder="+20 10 1234 5678 أو 01012345678"></label><small class="referral-hint">نتحقق من صيغة الرقم وتكراره في حسابك فقط، ولا نستطيع تأكيد أنه رقم فعّال دون تحقق خارجي.</small>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}<button class="button button-primary" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ حفظ الرقم..." : "إضافة الرقم ←"}</button></form></section></div>`;
+  }
+  if (state.modal === "whatsapp-share-added" && state.whatsappShareDraft) {
+    const finished = remainingReferrals() === 0;
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${finished ? "اكتمل العدد المطلوب!" : "تمت إضافة الرقم"}</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${finished ? "اكتملت الأرقام العشرة، وفتحت لك منصات التعلّم." : `تم تسجيل رقم مختلف. باقي ${remainingReferrals()} أرقام.`} ${finished ? "" : "لا يلزم أن يسجل أصحابك في المنصة."}</p><div class="form-grid"><a class="button button-outline button-wide" href="${h(state.whatsappShareDraft.url)}" target="_blank" rel="noopener noreferrer">إرسال الدعوة عبر واتساب (اختياري)</a><button class="button button-primary button-wide" data-action="change-whatsapp-number" ${finished ? "disabled" : ""}>${finished ? "تم — ابدأ التعلّم" : "إضافة رقم آخر"}</button></div></section></div>`;
   }
   if (state.modal === "profile") {
+    const loginCode = state.studentLoginCode || linkedLoginCode(state.user);
+    const codeEnabled = Boolean(loginCode && linkedLoginCode(state.user) === loginCode);
     return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>إعدادات الحساب</h2><button class="icon-button" data-action="close-modal">×</button></div>
-      ${state.admin ? `<div class="profile-details"><div><span>الحساب</span><b>${h(state.user.email || "دخول آمن للمشرف")}</b></div><div><span>الدور</span><b>مشرف AF MASTER</b></div><button class="button button-outline" data-action="logout">تسجيل الخروج</button></div>` : `<form class="form-grid" data-form="school-info"><p class="muted">كود الدعوة: <b class="code">${h(state.profile.studentCode || "—")}</b></p><small>سجّل الدخول إلى حسابك باستخدام Google.</small><label>الصف الدراسي<select name="grade">${gradeOptions(state.profile.grade)}</select></label><label>المسار<select name="track">${trackOptions(state.profile.track)}</select></label><button class="button button-primary">حفظ التعديلات</button></form>`}</section></div>`;
+      ${state.admin ? `<div class="profile-details"><div><span>الحساب</span><b>${h(state.user.email || "دخول آمن للمشرف")}</b></div><div><span>الدور</span><b>مشرف AF MASTER</b></div><button class="button button-outline" data-action="logout">تسجيل الخروج</button></div>` : `<form class="form-grid" data-form="school-info"><p class="muted">كود الدعوة: <b class="code">${h(state.profile.studentCode || "—")}</b></p><div class="profile-details"><div><span>كود الدخول الرقمي (سري)</span><b class="code" dir="ltr">${h(loginCode || "غير مفعّل")}</b></div><small>لا تشارك كود الدخول مع أي شخص.</small><button type="button" class="button button-outline" data-action="enable-code-login" ${state.busy || codeEnabled ? "disabled" : ""}>${codeEnabled ? "كود الدخول مفعّل ✓" : loginCode ? "تفعيل كود الدخول" : "إنشاء كود دخول رقمي"}</button>${loginCode ? `<button type="button" class="text-button" data-copy="${h(loginCode)}">نسخ كود الدخول</button>` : ""}</div><label>الصف الدراسي<select name="grade">${gradeOptions(state.profile.grade)}</select></label><label>المسار<select name="track">${trackOptions(state.profile.track)}</select></label><button class="button button-primary">حفظ التعديلات</button></form>`}</section></div>`;
   }
   if (state.modal === "course") {
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>إضافة منصة جديدة</h2><button class="icon-button" data-action="close-modal">×</button></div><form class="form-grid" data-form="course"><label>اسم المنصة<input name="title" required placeholder="مثال: منصة الرياضيات"></label><label>وصف مختصر<input name="description" placeholder="محتوى المنصة"></label><div class="form-row"><label>الصف<select name="grade">${gradeOptions()}</select></label><label>المسار<select name="track">${trackOptions()}</select></label></div><button class="button button-primary">＋ إضافة المنصة</button></form></section></div>`;
+    const course = state.courses.find((item) => item.id === state.editingCourseId) || state.selectedCourse;
+    const editing = Boolean(state.editingCourseId && course);
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل المنصة" : "إضافة منصة جديدة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><form class="form-grid" data-form="course"><label>اسم المنصة<input name="title" required value="${editing ? h(course.title) : ""}" placeholder="مثال: منصة الرياضيات"></label><label>وصف مختصر<input name="description" value="${editing ? h(course.description || "") : ""}" placeholder="محتوى المنصة"></label>${editing ? `<div class="filter-chips"><span class="filter-chip">${h(course.grade)}</span><span class="filter-chip">${h(course.track)}</span></div><small class="muted">الصف والمسار ثابتان بعد إضافة المنصة للحفاظ على ربط الدروس.</small>` : `<div class="form-row"><label>الصف<select name="grade">${gradeOptions()}</select></label><label>المسار<select name="track">${trackOptions()}</select></label></div>`}<button class="button button-primary">${editing ? "حفظ التعديلات" : "＋ إضافة المنصة"}</button></form></section></div>`;
+  }
+  if (state.modal === "chapter") {
+    const chapter = state.chapters.find((item) => item.id === state.editingChapterId);
+    const editing = Boolean(chapter);
+    const nextNumber = Math.max(0, ...state.chapters.map((item) => Number(item.number) || 0)) + 1;
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل الفصل" : "إضافة فصل للمنصة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${h(state.selectedCourse?.title || "")}</p><form class="form-grid" data-form="chapter"><div class="form-row"><label>الترتيب<input name="number" type="number" min="1" value="${editing ? h(chapter.number) : nextNumber}" required></label><label>نوع الفصل<select name="type"><option value="chapter" ${editing && chapter.type === "exam" ? "" : "selected"}>فصل دراسي</option><option value="exam" ${editing && chapter.type === "exam" ? "selected" : ""}>قسم الامتحانات</option></select></label></div><label>اسم الفصل / القسم<input name="title" required maxlength="100" value="${editing ? h(chapter.title) : ""}" placeholder="${editing && chapter.type === "exam" ? "الامتحانات" : "مثال: Chapter 1 — الحركة"}"></label><button class="button button-primary">${editing ? "حفظ الفصل" : "＋ إضافة الفصل"}</button></form></section></div>`;
   }
   if (state.modal === "lesson") {
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>إضافة محتوى · ${h(state.selectedCourse?.title || "")}</h2><button class="icon-button" data-action="close-modal">×</button></div><form class="form-grid lesson-form" data-form="lesson">
-      <div class="form-row"><label>رقم الفصل<input name="chapterNumber" type="number" min="1" value="1" required></label><label>اسم الفصل<input name="chapterTitle" required placeholder="اسم الفصل"></label></div>
+    const selectedChapter = state.chapters.find((item) => item.id === state.selectedChapterId) || state.chapters[0];
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>إضافة درس أو امتحان</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${h(state.selectedCourse?.title || "")}</p>${state.chapters.length ? `<form class="form-grid lesson-form" data-form="lesson">
+      <label>الفصل<select name="chapterId" required>${state.chapters.map((chapter) => `<option value="${h(chapter.id)}" ${selectedChapter?.id === chapter.id ? "selected" : ""}>${h(chapter.title)}</option>`).join("")}</select></label>
       <label>اسم الدرس / الامتحان<input name="title" required placeholder="مثال: الدرس الأول"></label><label>نوع المحتوى<select name="type"><option value="lesson">درس</option><option value="exam">امتحان</option></select></label>
       <div class="question-fields">${Array.from({ length: 3 }, (_, index) => questionFields(index)).join("")}</div>
-      <button type="button" class="text-button" data-action="add-question">＋ إضافة سؤال</button><button class="button button-primary">حفظ المحتوى</button></form></section></div>`;
+      <button type="button" class="text-button" data-action="add-question">＋ إضافة سؤال</button><button class="button button-primary">حفظ المحتوى</button></form>` : `<div class="empty-state"><p>أنشئ فصلاً أولاً، ثم أضف الدروس والامتحانات بداخله.</p><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>`}</section></div>`;
   }
   return "";
 }
@@ -663,6 +1010,14 @@ async function handleSubmit(event) {
   render();
   try {
     switch (form.dataset.form) {
+      case "code-login": {
+        const code = latinDigits(data.code).trim();
+        if (!/^\d{24}$/.test(code)) throw new Error("أدخل كود الدخول المكوّن من 24 رقماً.");
+        await signInWithEmailAndPassword(auth, loginEmailForCode(code), code);
+        state.modal = "";
+        state.error = "";
+        break;
+      }
       case "register": {
         const fullName = normalizeStudentName(data.fullName);
         const normalizedName = fullName.toLowerCase();
@@ -694,6 +1049,7 @@ async function handleSubmit(event) {
         }
 
         const studentCode = createStudentCode();
+        const loginCode = createNumericLoginCode();
         const profileRef = doc(db, "profiles", state.user.uid);
         const batch = writeBatch(db);
         batch.set(profileRef, {
@@ -710,7 +1066,16 @@ async function handleSubmit(event) {
           isActive: true,
           referralCount: 0,
           whatsappShareCount: 0,
+          whatsappChannelJoined: false,
           lastWhatsAppShareId: null,
+          createdAt: serverTimestamp(),
+        });
+        batch.set(doc(db, "profiles", state.user.uid, "privateAuth", "login"), {
+          loginCode,
+          createdAt: serverTimestamp(),
+        });
+        batch.set(doc(db, "loginCodes", loginCode), {
+          uid: state.user.uid,
           createdAt: serverTimestamp(),
         });
         batch.set(doc(db, "phoneNumbers", phone), {
@@ -736,7 +1101,16 @@ async function handleSubmit(event) {
         state.device = { status: "active" };
         listenProfile(state.user.uid);
         listenSharedData();
-        notify("تم إنشاء حسابك بنجاح.");
+        state.studentLoginCode = loginCode;
+        state.modal = "student-login-code";
+        try {
+          state.user = await linkNumericLoginCode(state.user, loginCode);
+          await saveNumericLoginCode(state.user.uid, loginCode);
+          notify("تم إنشاء حسابك وتفعيل كود الدخول الرقمي.");
+        } catch (error) {
+          console.error("Student login-code activation failed after account creation.", error);
+          state.error = loginCodeSetupError(error);
+        }
         break;
       }
       case "whatsapp-share": {
@@ -745,35 +1119,111 @@ async function handleSubmit(event) {
           throw new Error("اكتب رقم شخص آخر، وليس رقمك.");
         }
         const recipientHash = await hashWhatsAppNumber(phone);
+        const profileRef = doc(db, "profiles", state.user.uid);
+        const shareRef = doc(db, "profiles", state.user.uid, "whatsappShares", recipientHash);
+        const [profileSnapshot, existingShare] = await Promise.all([
+          getDoc(profileRef),
+          getDoc(shareRef),
+        ]);
+        if (!profileSnapshot.exists()) throw new Error("تعذر العثور على ملف الطالب.");
+        if (existingShare.exists()) throw new Error("تمت إضافة هذا الرقم من قبل. أدخل رقماً مختلفاً.");
+        const currentCount = Number(profileSnapshot.data().whatsappShareCount || 0);
+        if (currentCount >= 10) throw new Error("اكتمل العدد المطلوب بالفعل.");
         const text = `انضم إلى AF MASTER وابدأ التعلم معي! ${location.origin}${location.pathname}?ref=${state.profile?.studentCode || ""}`;
-        state.whatsappShareDraft = {
+        const batch = writeBatch(db);
+        batch.update(profileRef, {
+          whatsappShareCount: increment(1),
+          lastWhatsAppShareId: recipientHash,
+        });
+        batch.set(shareRef, {
           recipientHash,
+          createdAt: serverTimestamp(),
+        });
+        await batch.commit();
+        const nextCount = currentCount + 1;
+        state.profile = {
+          ...profileSnapshot.data(),
+          whatsappShareCount: nextCount,
+          lastWhatsAppShareId: recipientHash,
+        };
+        state.whatsappShareDraft = {
           url: `https://wa.me/${phone}?text=${encodeURIComponent(text)}`,
         };
-        state.whatsappShareOpened = false;
-        state.modal = "whatsapp-share-confirm";
+        state.modal = "whatsapp-share-added";
         state.error = "";
+        listenSharedData();
+        notify(nextCount >= 10
+          ? "اكتمل العدد! منصات التعلّم أصبحت متاحة."
+          : `تمت إضافة الرقم. باقي ${10 - nextCount} أرقام مختلفة.`);
         break;
       }
       case "chat":
-        await call("sendChatMessage", {
-          roomType: state.nav === "support" ? "support" : "students",
-          recipientUid: state.nav === "support" && state.admin ? state.supportTarget : "",
-          text: String(data.text || "").trim(),
-        });
+        await writeChatMessage(data.text);
         state.chatText = "";
         break;
-      case "course":
-        await addDoc(collection(db, "courses"), {
-          title: String(data.title).trim(),
-          description: String(data.description || "").trim(),
-          grade: data.grade,
-          track: data.track,
-          createdAt: serverTimestamp(),
-        });
+      case "course": {
+        const title = String(data.title || "").trim();
+        const description = String(data.description || "").trim();
+        if (!title) throw new Error("اكتب اسم المنصة.");
+        let notice;
+        if (state.editingCourseId) {
+          await updateDoc(doc(db, "courses", state.editingCourseId), { title, description });
+          if (state.selectedCourse?.id === state.editingCourseId) {
+            state.selectedCourse = { ...state.selectedCourse, title, description };
+          }
+          notice = "تم تحديث المنصة.";
+        } else {
+          if (!grades.includes(String(data.grade)) || !tracks.includes(String(data.track))) {
+            throw new Error("اختر الصف والمسار الدراسيين.");
+          }
+          await addDoc(collection(db, "courses"), {
+            title,
+            description,
+            grade: data.grade,
+            track: data.track,
+            createdAt: serverTimestamp(),
+          });
+          notice = "تمت إضافة المنصة بنجاح.";
+        }
         state.modal = "";
-        notify("تمت إضافة المنصة بنجاح.");
+        state.editingCourseId = null;
+        notify(notice);
         break;
+      }
+      case "chapter": {
+        const number = Number(data.number);
+        const title = String(data.title || "").trim();
+        const type = String(data.type || "");
+        if (!Number.isInteger(number) || number < 1 || number > 999) {
+          throw new Error("أدخل ترتيباً صحيحاً للفصل.");
+        }
+        if (!title || title.length > 100) throw new Error("اكتب اسماً صحيحاً للفصل.");
+        if (!["chapter", "exam"].includes(type)) throw new Error("اختر نوع الفصل.");
+        const duplicate = state.chapters.some((chapter) =>
+          chapter.id !== state.editingChapterId
+          && Number(chapter.number) === number
+          && chapter.type === type);
+        if (duplicate) throw new Error("يوجد فصل بهذا الترتيب والنوع بالفعل.");
+        const chapterData = { number, title, type };
+        if (state.editingChapterId) {
+          await updateDoc(doc(db, "chapters", state.editingChapterId), chapterData);
+          state.notice = "تم تحديث الفصل.";
+        } else {
+          await addDoc(collection(db, "chapters"), {
+            ...chapterData,
+            courseId: state.selectedCourse.id,
+            grade: state.selectedCourse.grade,
+            track: state.selectedCourse.track,
+            createdAt: serverTimestamp(),
+          });
+          state.notice = "تمت إضافة الفصل. يمكنك الآن إضافة الدروس والامتحانات بداخله.";
+        }
+        state.error = "";
+        state.editingChapterId = null;
+        state.modal = "";
+        render();
+        break;
+      }
       case "lesson": {
         const entries = [];
         for (let index = 0; index < 8; index += 1) {
@@ -782,13 +1232,19 @@ async function handleSubmit(event) {
           if (question && answer) entries.push({ question, answer });
         }
         if (!entries.length) throw new Error("أضف سؤالاً وإجابة واحدة على الأقل.");
+        const title = String(data.title || "").trim();
+        if (!title) throw new Error("اكتب اسم الدرس أو الامتحان.");
+        if (!["lesson", "exam"].includes(String(data.type))) throw new Error("اختر نوع محتوى صحيحاً.");
+        const chapter = state.chapters.find((item) => item.id === data.chapterId);
+        if (!chapter) throw new Error("اختر فصلاً صحيحاً.");
         await addDoc(collection(db, "lessons"), {
           courseId: state.selectedCourse.id,
+          chapterId: chapter.id,
           grade: state.selectedCourse.grade,
           track: state.selectedCourse.track,
-          chapterNumber: Number(data.chapterNumber),
-          chapterTitle: String(data.chapterTitle).trim(),
-          title: String(data.title).trim(),
+          chapterNumber: chapter.number,
+          chapterTitle: chapter.title,
+          title,
           type: data.type,
           entries,
           createdAt: serverTimestamp(),
@@ -809,17 +1265,34 @@ async function handleSubmit(event) {
         state.modal = "";
         notify("تم تحديث الصف والمسار الدراسي.");
         break;
-      case "announcement":
-        await call("createAnnouncement", { title: data.title, body: data.body });
+      case "announcement": {
+        const title = String(data.title || "").trim();
+        const body = String(data.body || "").trim();
+        if (!title || title.length > 120 || !body || body.length > 3000) {
+          throw new Error("أكمل عنوان الإعلان ومحتواه.");
+        }
+        await addDoc(collection(db, "announcements"), {
+          title,
+          body,
+          createdAt: serverTimestamp(),
+          expiresAt: Timestamp.fromDate(new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)),
+          createdBy: state.user.uid,
+        });
         notify("تم إرسال الإعلان للطلاب. سيُحذف تلقائياً بعد 3 أيام.");
         break;
+      }
       default:
         break;
     }
   } catch (error) {
     console.error(`AF MASTER form submission failed (${form.dataset.form}).`, error);
-    state.error = form.dataset.form === "register" && error?.code === "permission-denied"
+    state.error = form.dataset.form === "code-login"
+      && ["auth/invalid-credential", "auth/user-not-found", "auth/wrong-password", "auth/invalid-email"].includes(error?.code)
+      ? "كود الدخول غير صحيح أو لم يتم تفعيله لهذا الحساب."
+      : form.dataset.form === "register" && error?.code === "permission-denied"
       ? "الاسم أو رقم الهاتف مستخدم بالفعل، أو لم تُنشر قواعد التسجيل الجديدة في Firestore."
+      : form.dataset.form === "whatsapp-share" && error?.code === "permission-denied"
+        ? "تعذر إضافة الرقم. تأكد من نشر قواعد Firestore الخاصة بالمشاركة."
       : messageFromError(error);
   } finally {
     state.busy = false;
@@ -854,43 +1327,32 @@ async function loginWithGoogle() {
   }
 }
 
-async function confirmWhatsAppShare() {
-  if (!state.whatsappShareDraft || !state.whatsappShareOpened || !state.user) return;
+async function enableStudentCodeLogin() {
+  if (!state.user || !state.profile || state.admin) {
+    throw new Error("سجّل الدخول إلى حساب الطالب أولاً.");
+  }
   state.busy = true;
   state.error = "";
   render();
+  let code = null;
   try {
-    const { recipientHash } = state.whatsappShareDraft;
-    const shareRef = doc(db, "profiles", state.user.uid, "whatsappShares", recipientHash);
-    if ((await getDoc(shareRef)).exists()) {
-      throw new Error("تم احتساب هذا الرقم من قبل. أدخل رقم شخص مختلف.");
-    }
-    const nextCount = Number(state.profile?.whatsappShareCount || 0) + 1;
-    const batch = writeBatch(db);
-    batch.update(doc(db, "profiles", state.user.uid), {
-      whatsappShareCount: increment(1),
-      lastWhatsAppShareId: recipientHash,
-    });
-    batch.set(shareRef, {
-      recipientHash,
-      createdAt: serverTimestamp(),
-    });
-    await batch.commit();
-    state.profile = {
-      ...state.profile,
-      whatsappShareCount: nextCount,
-      lastWhatsAppShareId: recipientHash,
-    };
-    state.whatsappShareDraft = null;
-    state.whatsappShareOpened = false;
-    state.modal = "";
-    listenSharedData();
-    notify(nextCount >= 10 ? "اكتمل العدد! منصات التعلّم أصبحت متاحة." : `تم تسجيل الإرسال. ${10 - nextCount} أرقام مختلفة متبقية.`);
+    code = state.studentLoginCode || linkedLoginCode(state.user) || createNumericLoginCode();
+    state.studentLoginCode = code;
+    state.user = await linkNumericLoginCode(auth.currentUser || state.user, code);
+    await saveNumericLoginCode(state.user.uid, code);
+    notify("تم تفعيل الدخول بالكود الرقمي. احتفظ به بسرية.");
   } catch (error) {
-    console.error("WhatsApp share confirmation failed.", error);
-    state.error = error?.code === "permission-denied"
-      ? "تعذر تسجيل الرقم؛ ربما احتُسب بالفعل. حدّث الصفحة، وإن استمرت المشكلة فتأكد من نشر قواعد Firestore الجديدة."
-      : messageFromError(error);
+    console.error("Student code-login setup failed.", error);
+    let setupError = error;
+    if (code && !state.user.providerData.some((item) => item.providerId === "password")) {
+      try {
+        await saveNumericLoginCode(state.user.uid, code);
+      } catch (saveError) {
+        console.error("Student login code could not be saved to Firestore.", saveError);
+        setupError = saveError;
+      }
+    }
+    state.error = loginCodeSetupError(setupError);
   } finally {
     state.busy = false;
     render();
@@ -902,13 +1364,51 @@ async function clickAction(action, target, originalTarget) {
     case "google-login":
       await loginWithGoogle();
       break;
+    case "code-login":
+      state.modal = "code-login";
+      state.error = "";
+      render();
+      break;
+    case "enable-code-login":
+      await enableStudentCodeLogin();
+      break;
+    case "confirm-channel-subscription":
+      if (state.busy || state.admin || !state.user || !state.profile?.isActive || state.profile.whatsappChannelJoined) break;
+      state.busy = true;
+      state.error = "";
+      render();
+      try {
+        await updateDoc(doc(db, "profiles", state.user.uid), { whatsappChannelJoined: true });
+        state.profile = { ...state.profile, whatsappChannelJoined: true };
+        notify("تم حفظ تأكيد الاشتراك. أهلاً بك في AF MASTER!");
+      } catch (error) {
+        console.error("WhatsApp channel subscription confirmation failed.", error);
+        state.error = messageFromError(error);
+      } finally {
+        state.busy = false;
+        render();
+      }
+      break;
     case "logout": await logout(); break;
     case "dismiss": state.error = ""; state.notice = ""; render(); break;
     case "profile": state.modal = "profile"; render(); break;
+    case "edit-course":
+      if (!state.admin || !state.selectedCourse) break;
+      state.editingCourseId = state.selectedCourse.id;
+      state.modal = "course";
+      render();
+      break;
+    case "edit-chapter":
+      if (!state.admin || !state.chapters.some((chapter) => chapter.id === target.dataset.chapter)) break;
+      state.editingChapterId = target.dataset.chapter;
+      state.modal = "chapter";
+      render();
+      break;
     case "close-modal":
       state.modal = "";
       state.whatsappShareDraft = null;
-      state.whatsappShareOpened = false;
+      state.editingCourseId = null;
+      state.editingChapterId = null;
       state.error = "";
       render();
       break;
@@ -916,7 +1416,8 @@ async function clickAction(action, target, originalTarget) {
       if (originalTarget === target) {
         state.modal = "";
         state.whatsappShareDraft = null;
-        state.whatsappShareOpened = false;
+        state.editingCourseId = null;
+        state.editingChapterId = null;
         state.error = "";
         render();
       }
@@ -927,17 +1428,9 @@ async function clickAction(action, target, originalTarget) {
       state.error = "";
       render();
       break;
-    case "open-whatsapp":
-      state.whatsappShareOpened = true;
-      window.setTimeout(render, 250);
-      break;
-    case "confirm-whatsapp-share":
-      await confirmWhatsAppShare();
-      break;
     case "change-whatsapp-number":
       state.modal = "whatsapp-share";
       state.whatsappShareDraft = null;
-      state.whatsappShareOpened = false;
       state.error = "";
       render();
       break;
@@ -949,8 +1442,23 @@ async function clickAction(action, target, originalTarget) {
         render();
       }
       break;
-    case "add-course": state.modal = "course"; render(); break;
-    case "add-lesson": state.modal = "lesson"; render(); break;
+    case "add-course":
+      state.editingCourseId = null;
+      state.modal = "course";
+      render();
+      break;
+    case "add-chapter":
+      if (!state.admin || !state.selectedCourse) break;
+      state.editingChapterId = null;
+      state.modal = "chapter";
+      render();
+      break;
+    case "add-lesson":
+      if (!state.admin || !state.selectedCourse) break;
+      state.selectedChapterId = target.dataset.chapter || "";
+      state.modal = "lesson";
+      render();
+      break;
     case "add-question": {
       const form = target.closest("form");
       const fields = form.querySelector(".question-fields");
@@ -959,7 +1467,7 @@ async function clickAction(action, target, originalTarget) {
       break;
     }
     case "back-courses":
-      state.selectedCourse = null; state.selectedLesson = null; state.examLessonId = ""; listenLessons(null); render(); break;
+      state.selectedCourse = null; state.selectedChapterId = ""; state.selectedLesson = null; state.examLessonId = ""; listenLessons(null); render(); break;
     case "back-lessons": state.selectedLesson = null; render(); break;
     case "next-lesson": {
       const index = state.lessons.findIndex((lesson) => lesson.id === state.selectedLesson?.id);
@@ -977,14 +1485,25 @@ async function moderateStudent(uid, ban) {
   if (ban) {
     if (!window.confirm(`هل تريد حظر ${student.fullName}؟`)) return;
     try {
-      await call("setStudentStatus", { uid, banned: true });
+      await updateDoc(doc(db, "profiles", uid), {
+        isActive: false,
+        statusUpdatedAt: serverTimestamp(),
+      });
       notify("تم حظر الحساب.");
     } catch (error) { fail(error); }
   } else {
     const body = window.prompt(`اكتب سبب التحذير للطالب ${student.fullName}:`);
     if (!body) return;
     try {
-      await call("createWarning", { uid, body });
+      const cleanBody = body.trim();
+      if (cleanBody.length < 4 || cleanBody.length > 500) {
+        throw new Error("اكتب سبب التحذير بطول يتراوح بين 4 و500 حرف.");
+      }
+      await addDoc(collection(db, "profiles", uid, "warnings"), {
+        body: cleanBody,
+        createdAt: serverTimestamp(),
+        createdBy: state.user.uid,
+      });
       notify("تم إرسال التحذير للطالب.");
     } catch (error) { fail(error); }
   }
@@ -1002,6 +1521,8 @@ async function handleClick(event) {
       unsubscribers.get("chat1")?.();
       unsubscribers.delete("chat0");
       unsubscribers.delete("chat1");
+      window.clearTimeout(chatExpiryTimer);
+      chatExpiryTimer = null;
     }
     if (state.nav === "updates") markAnnouncementsSeen();
     state.error = "";
@@ -1011,6 +1532,7 @@ async function handleClick(event) {
   const courseButton = event.target.closest("[data-course]");
   if (courseButton) {
     state.selectedCourse = state.courses.find((course) => course.id === courseButton.dataset.course) || null;
+    state.selectedChapterId = "";
     state.selectedLesson = null;
     state.examLessonId = "";
     state.nav = "learning";
@@ -1029,7 +1551,7 @@ async function handleClick(event) {
   if (copyButton) {
     try {
       await navigator.clipboard.writeText(copyButton.dataset.copy);
-      notify("تم نسخ الإجابة.");
+      notify("تم النسخ إلى الحافظة.");
     } catch (error) { fail(error); }
     return;
   }
@@ -1037,7 +1559,7 @@ async function handleClick(event) {
   if (deleteButton) {
     try {
       const roomId = state.nav === "chat" ? "students" : `support_${state.supportTarget}`;
-      await call("deleteChatMessage", { roomId, messageId: deleteButton.dataset.deleteMessage });
+      await deleteDoc(doc(db, "chatRooms", roomId, "messages", deleteButton.dataset.deleteMessage));
       notify("تم حذف الرسالة.");
     } catch (error) { fail(error); }
     return;

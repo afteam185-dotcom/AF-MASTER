@@ -30,6 +30,120 @@ service cloud.firestore {
     function isSelf(uid) {
       return signedIn() && request.auth.uid == uid;
     }
+    function validAdminStudentStatusUpdate(uid) {
+      return isAdmin()
+        && !(uid in [
+          'J9BuDGBCXTced8WtkJsjDQUw94g2',
+          'BrequkkRPuRVaLgmlN8i8tMmN7I2',
+          'ePEzd3F1BNXJvwteHU2TqTYshMq2'
+        ])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'isActive', 'statusUpdatedAt'
+        ])
+        && request.resource.data.isActive is bool
+        && request.resource.data.statusUpdatedAt == request.time;
+    }
+    function validMessageExpiry(value) {
+      return value is timestamp
+        && value > request.time
+        && value <= request.time + duration.value(25, 'h');
+    }
+    function validChatMessageFields() {
+      return request.resource.data.keys().hasOnly([
+          'senderId', 'senderName', 'text', 'kind', 'createdAt', 'expiresAt'
+        ])
+        && request.resource.data.senderId is string
+        && request.resource.data.senderName is string
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 2000
+        && request.resource.data.createdAt == request.time;
+    }
+    function validChatMessage(roomId) {
+      return validChatMessageFields()
+        && (
+          (
+            isAdmin()
+            && request.resource.data.senderId == request.auth.uid
+            && request.resource.data.senderName == 'مشرف AF MASTER'
+            && request.resource.data.kind == 'admin'
+            && validMessageExpiry(request.resource.data.expiresAt)
+            && (
+              roomId == 'students'
+              || (
+                roomId.matches('^support_[A-Za-z0-9_-]+$')
+                && roomId == 'support_' + getAfter(
+                  /databases/$(database)/documents/chatRooms/$(roomId)
+                ).data.studentUid
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.awaitingAdminReply == false
+              )
+            )
+          )
+          || (
+            hasActiveProfile()
+            && request.resource.data.senderId == request.auth.uid
+            && request.resource.data.senderName
+              == get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.fullName
+            && request.resource.data.kind == 'student'
+            && (
+              (
+                roomId == 'students'
+                && validMessageExpiry(request.resource.data.expiresAt)
+              )
+              || (
+                roomId == 'support_' + request.auth.uid
+                && request.resource.data.expiresAt == null
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.studentUid == request.auth.uid
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.awaitingAdminReply == true
+              )
+            )
+          )
+          || (
+            hasActiveProfile()
+            && roomId == 'support_' + request.auth.uid
+            && request.resource.data.senderId == 'system'
+            && request.resource.data.senderName == 'AF MASTER'
+            && request.resource.data.text == 'تم استلام رسالتك، وسيتم الرد عليك خلال 24 ساعة.'
+            && request.resource.data.kind == 'system'
+            && validMessageExpiry(request.resource.data.expiresAt)
+            && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.studentUid == request.auth.uid
+            && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.awaitingAdminReply == true
+          )
+        );
+    }
+    function validSupportRoom(roomId) {
+      return request.resource.data.keys().hasAll([
+          'roomType', 'studentUid', 'updatedAt', 'awaitingAdminReply'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'roomType', 'studentUid', 'updatedAt', 'awaitingAdminReply'
+        ])
+        && request.resource.data.roomType == 'support'
+        && request.resource.data.studentUid is string
+        && roomId == 'support_' + request.resource.data.studentUid
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.awaitingAdminReply is bool
+        && (
+          (
+            isAdmin()
+            && exists(/databases/$(database)/documents/profiles/$(request.resource.data.studentUid))
+          )
+          || (
+            hasActiveProfile()
+            && request.resource.data.studentUid == request.auth.uid
+            && request.resource.data.awaitingAdminReply == true
+          )
+        );
+    }
+    function validStudentLoginCode(uid) {
+      let code = getAfter(
+        /databases/$(database)/documents/profiles/$(uid)/privateAuth/login
+      ).data.loginCode;
+      return code is string
+        && code.matches('^[0-9]{24}$')
+        && existsAfter(/databases/$(database)/documents/loginCodes/$(code))
+        && getAfter(/databases/$(database)/documents/loginCodes/$(code)).data.uid == uid;
+    }
     function validStudentProfile(uid) {
       return isSelf(uid)
         && request.auth.token.firebase.sign_in_provider == 'google.com'
@@ -41,12 +155,14 @@ service cloud.firestore {
         && request.resource.data.keys().hasAll([
           'uid', 'fullName', 'normalizedName', 'email', 'phone', 'grade', 'track',
           'studentCode', 'referredByUid', 'referralCodeUsed', 'isActive',
-          'referralCount', 'whatsappShareCount', 'lastWhatsAppShareId', 'createdAt'
+          'referralCount', 'whatsappShareCount', 'whatsappChannelJoined',
+          'lastWhatsAppShareId', 'createdAt'
         ])
         && request.resource.data.keys().hasOnly([
           'uid', 'fullName', 'normalizedName', 'email', 'phone', 'grade', 'track',
           'studentCode', 'referredByUid', 'referralCodeUsed', 'isActive',
-          'referralCount', 'whatsappShareCount', 'lastWhatsAppShareId', 'createdAt'
+          'referralCount', 'whatsappShareCount', 'whatsappChannelJoined',
+          'lastWhatsAppShareId', 'createdAt'
         ])
         && request.resource.data.uid == uid
         && request.resource.data.fullName is string
@@ -64,6 +180,7 @@ service cloud.firestore {
         && request.resource.data.isActive == true
         && request.resource.data.referralCount == 0
         && request.resource.data.whatsappShareCount == 0
+        && request.resource.data.whatsappChannelJoined == false
         && request.resource.data.lastWhatsAppShareId == null
         && request.resource.data.createdAt == request.time
         && existsAfter(/databases/$(database)/documents/phoneNumbers/$(request.resource.data.phone))
@@ -72,6 +189,7 @@ service cloud.firestore {
         && getAfter(/databases/$(database)/documents/profileNames/$(request.resource.data.normalizedName)).data.uid == uid
         && existsAfter(/databases/$(database)/documents/referralCodes/$(request.resource.data.studentCode))
         && getAfter(/databases/$(database)/documents/referralCodes/$(request.resource.data.studentCode)).data.uid == uid
+        && validStudentLoginCode(uid)
         && (
           (request.resource.data.referredByUid == null && request.resource.data.referralCodeUsed == null)
           || (
@@ -99,6 +217,7 @@ service cloud.firestore {
     function validWhatsAppShareIncrement(uid) {
       return isSelf(uid)
         && resource.data.isActive == true
+        && resource.data.get('whatsappShareCount', 0) < 10
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'whatsappShareCount', 'lastWhatsAppShareId'
         ])
@@ -120,8 +239,14 @@ service cloud.firestore {
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['grade', 'track'])
           && request.resource.data.grade in ['الأول الثانوي', 'الثاني الثانوي', 'الثالث الثانوي']
           && request.resource.data.track in ['عربي', 'لغات'])
+        || (isSelf(uid)
+          && resource.data.isActive == true
+          && resource.data.get('whatsappChannelJoined', false) == false
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['whatsappChannelJoined'])
+          && request.resource.data.whatsappChannelJoined == true)
         || validReferralIncrement(uid)
-        || validWhatsAppShareIncrement(uid);
+        || validWhatsAppShareIncrement(uid)
+        || validAdminStudentStatusUpdate(uid);
       allow delete: if false;
       match /referrals/{referralUid} {
         allow read: if isSelf(uid) || isAdmin();
@@ -137,7 +262,24 @@ service cloud.firestore {
       }
       match /warnings/{warningId} {
         allow read: if isSelf(uid) || isAdmin();
-        allow write: if false;
+        allow create: if isAdmin()
+          && request.resource.data.keys().hasOnly(['body', 'createdAt', 'createdBy'])
+          && request.resource.data.body is string
+          && request.resource.data.body.size() >= 4
+          && request.resource.data.body.size() <= 500
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.createdBy == request.auth.uid;
+        allow update, delete: if false;
+      }
+      match /privateAuth/{credentialId} {
+        allow get: if isSelf(uid) && credentialId == 'login';
+        allow list: if false;
+        allow create: if isSelf(uid)
+          && credentialId == 'login'
+          && request.resource.data.keys().hasOnly(['loginCode', 'createdAt'])
+          && request.resource.data.loginCode.matches('^[0-9]{24}$')
+          && request.resource.data.createdAt == request.time;
+        allow update, delete: if false;
       }
       match /whatsappShares/{shareId} {
         allow get: if isSelf(uid) || isAdmin();
@@ -154,6 +296,23 @@ service cloud.firestore {
       }
     }
 
+    match /loginCodes/{code} {
+      allow get: if isSelf(resource.data.uid);
+      allow list: if false;
+      allow create: if isSelf(request.resource.data.uid)
+        && code.matches('^[0-9]{24}$')
+        && request.resource.data.keys().hasOnly(['uid', 'createdAt'])
+        && request.resource.data.createdAt == request.time
+        && existsAfter(/databases/$(database)/documents/profiles/$(request.auth.uid)/privateAuth/login)
+        && getAfter(/databases/$(database)/documents/profiles/$(request.auth.uid)/privateAuth/login).data.loginCode == code;
+      allow update, delete: if false;
+    }
+
+    match /chapters/{chapterId} {
+      allow read: if isAdmin() || matchesStudentCourse(resource.data);
+      allow write: if isAdmin();
+    }
+
     match /courses/{courseId} {
       allow read: if isAdmin() || matchesStudentCourse(resource.data);
       allow write: if isAdmin();
@@ -165,21 +324,40 @@ service cloud.firestore {
 
     match /chatRooms/{roomId} {
       allow read: if isAdmin()
-        || (roomId == 'students' && hasActiveProfile())
-        || (roomId == 'support_' + request.auth.uid && hasActiveProfile());
-      allow write: if false;
+        || (signedIn() && roomId == 'support_' + request.auth.uid && hasActiveProfile());
+      allow create, update: if validSupportRoom(roomId);
+      allow delete: if false;
       match /messages/{messageId} {
         allow read: if isAdmin()
           || ((roomId == 'students' || roomId == 'support_' + request.auth.uid)
             && hasActiveProfile()
             && (resource.data.expiresAt == null || resource.data.expiresAt > request.time));
-        allow write: if false;
+        allow create: if validChatMessage(roomId);
+        allow update: if isAdmin()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expiresAt'])
+          && validMessageExpiry(request.resource.data.expiresAt);
+        allow delete: if isAdmin();
       }
     }
 
     match /announcements/{announcementId} {
       allow read: if isAdmin() || (hasActiveProfile() && resource.data.expiresAt > request.time);
-      allow write: if isAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+          'title', 'body', 'createdAt', 'expiresAt', 'createdBy'
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 120
+        && request.resource.data.body is string
+        && request.resource.data.body.size() > 0
+        && request.resource.data.body.size() <= 3000
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.expiresAt is timestamp
+        && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt <= request.time + duration.value(73, 'h');
+      allow update, delete: if isAdmin();
       match /seen/{uid} {
         allow read: if isSelf(uid) || isAdmin();
         allow create: if isSelf(uid) && hasActiveProfile()
