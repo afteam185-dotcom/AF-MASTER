@@ -13,12 +13,15 @@ import {
   collectionGroup,
   doc,
   getDoc,
+  increment,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
   setDoc,
+  updateDoc,
   where,
+  writeBatch,
 } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
 import { getFirestore } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
 import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-functions.js";
@@ -33,8 +36,8 @@ googleProvider.setCustomParameters({ prompt: "select_account" });
 const root = document.querySelector("#root");
 const introOverlay = document.querySelector("#intro-overlay");
 const introVideo = document.querySelector("#intro-video");
-const introSoundButton = document.querySelector("#intro-sound");
-let introFallbackTimer;
+const introStartButton = document.querySelector("#intro-start");
+const introMessage = document.querySelector("#intro-message");
 const grades = ["الأول الثانوي", "الثاني الثانوي", "الثالث الثانوي"];
 const tracks = ["عربي", "لغات"];
 const state = {
@@ -46,11 +49,8 @@ const state = {
   adminLoginError: "",
   adminLoginRequested: false,
   adminDeviceCount: 0,
-  codeLoginOpen: false,
-  codeLoginError: "",
   authReady: false,
-  introVisible: sessionStorage.getItem("af-master-intro-shown") !== "true"
-    && !window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+  introVisible: sessionStorage.getItem("af-master-intro-shown") !== "true",
   busy: false,
   error: "",
   notice: "",
@@ -64,7 +64,6 @@ const state = {
   warnings: [],
   students: [],
   deviceCounts: {},
-  deviceRequests: [],
   supportTarget: "",
   search: "",
   referralCode: new URLSearchParams(location.search).get("ref") || "",
@@ -76,7 +75,6 @@ const state = {
 
 const unsubscribers = new Map();
 let resolvingAuth = false;
-let profileCreatedDuringSession = false;
 
 function h(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -93,6 +91,15 @@ function latinDigits(value) {
     const codePoint = digit.codePointAt(0) || 0;
     return String(codePoint >= 0x06f0 ? codePoint - 0x06f0 : codePoint - 0x0660);
   });
+}
+
+function normalizeStudentName(value) {
+  return String(value).normalize("NFKC").trim().replace(/\s+/g, " ");
+}
+
+function createStudentCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(4));
+  return `AF${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
 }
 
 function getDeviceId() {
@@ -121,7 +128,7 @@ function messageFromError(error) {
   if (code.includes("permission-denied")) return message || "ليس لديك صلاحية لتنفيذ هذا الإجراء.";
   if (code.includes("unavailable")) return "تعذر الاتصال بالخدمة. تحقق من الإنترنت وحاول مجدداً.";
   if (code.includes("internal") || message.trim().toUpperCase() === "INTERNAL") {
-    return "خدمة Firebase غير متاحة. تأكد من تفعيل Cloud Functions API ونشر وظائف المشروع.";
+    return "حدث خطأ أثناء تنفيذ العملية. حاول مرة أخرى.";
   }
   return message || "حدث خطأ غير متوقع. حاول مرة أخرى.";
 }
@@ -145,7 +152,25 @@ function finishIntro() {
   introOverlay.setAttribute("aria-hidden", "true");
   introVideo.pause();
   sessionStorage.setItem("af-master-intro-shown", "true");
-  window.clearTimeout(introFallbackTimer);
+}
+
+function showIntroStart(message, buttonLabel = "تشغيل المقدمة بالصوت") {
+  introMessage.textContent = message;
+  introStartButton.textContent = buttonLabel;
+  introStartButton.hidden = false;
+}
+
+async function playIntro() {
+  introStartButton.hidden = true;
+  try {
+    introVideo.muted = false;
+    introVideo.volume = 1;
+    await introVideo.play();
+    introMessage.textContent = "";
+  } catch (error) {
+    console.warn("Intro video playback was blocked.", error);
+    showIntroStart("اضغط لبدء المقدمة بالصوت ومتابعة استخدام المنصة.");
+  }
 }
 
 function timestampText(value, includeTime = false) {
@@ -228,10 +253,6 @@ function listenSharedData() {
       state.students = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
       render();
     });
-    listen("requests", query(collection(db, "deviceRequests"), where("status", "==", "pending")), (snapshot) => {
-      state.deviceRequests = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-      render();
-    });
     listen("deviceCounts", query(collectionGroup(db, "sessions"), where("active", "==", true)), (snapshot) => {
       const counts = {};
       for (const session of snapshot.docs) {
@@ -308,57 +329,20 @@ function listenChat() {
   });
 }
 
-async function establishDevice(user, claims, admin) {
+async function establishAdminDevice(user, claims) {
   const deviceId = getDeviceId();
   const sessionReference = doc(db, "devices", user.uid, "sessions", deviceId);
   if (claims.deviceSession === deviceId) {
     const session = await getDoc(sessionReference);
     if (session.exists() && session.data().active === true) {
       state.device = { status: "active" };
-      if (!admin && state.profile && !/^\d{14}$/.test(state.profile.loginCode || "")) {
-        const code = await call("registerDevice", {
-          deviceId,
-          label: navigator.userAgent.slice(0, 96),
-        });
-        if (code.loginCode) {
-          state.profile = { ...state.profile, loginCode: code.loginCode };
-          notify(`كود الدخول الرقمي لحسابك: ${code.loginCode} — احتفظ به ولا تشاركه.`);
-        }
-      }
       return;
     }
   }
-  if (!admin && !state.profile) return;
   const result = await call("registerDevice", {
     deviceId,
     label: navigator.userAgent.slice(0, 96),
   });
-  if (result.loginCode) {
-    const hadNumericCode = /^\d{14}$/.test(state.profile?.loginCode || "");
-    state.profile = state.profile ? { ...state.profile, loginCode: result.loginCode } : state.profile;
-    if (!hadNumericCode) {
-      notify(`كود الدخول الرقمي لحسابك: ${result.loginCode} — احتفظ به ولا تشاركه.`);
-    }
-  }
-  if (result.status === "pending") {
-    state.device = result;
-    listen("deviceRequest", doc(db, "deviceRequests", result.requestId), async (snapshot) => {
-      const status = snapshot.data()?.status;
-      if (status === "approved") {
-        const approved = await call("registerDevice", {
-          deviceId,
-          label: navigator.userAgent.slice(0, 96),
-        });
-        if (approved.token) await signInWithCustomToken(auth, approved.token);
-        state.device = { status: approved.status };
-        render();
-      } else if (status === "rejected") {
-        state.deviceError = "تم رفض طلب إضافة هذا الجهاز من المشرف.";
-        render();
-      }
-    });
-    return;
-  }
   if (result.token) {
     state.device = { status: "active" };
     resolvingAuth = true;
@@ -400,22 +384,19 @@ onAuthStateChanged(auth, async (user) => {
     if (state.admin) state.adminLoginRequested = false;
     if (!state.admin) {
       const profile = await getDoc(doc(db, "profiles", user.uid));
-      if (profile.exists()) {
-        state.profile = profile.data();
-        profileCreatedDuringSession = false;
-      }
-      else if (profileCreatedDuringSession) {
-        profileCreatedDuringSession = false;
-        const freshProfile = await getDoc(doc(db, "profiles", user.uid));
-        if (freshProfile.exists()) state.profile = freshProfile.data();
-      }
+      if (profile.exists()) state.profile = profile.data();
     }
-    if (state.admin || state.profile) {
-      await establishDevice(user, token.claims, state.admin);
+    if (state.admin) {
+      await establishAdminDevice(user, token.claims);
       if (state.device?.status === "active") {
-        if (!state.admin) listenProfile(user.uid);
         listenSharedData();
         listenDeviceSession(user.uid);
+      }
+    } else if (state.profile) {
+      state.device = { status: "active" };
+      if (state.profile.isActive) {
+        listenProfile(user.uid);
+        listenSharedData();
       }
     }
   } catch (error) {
@@ -464,17 +445,6 @@ function loginView() {
         <button class="google-button" data-action="google-login" ${state.busy ? "disabled" : ""}>
           <span class="google-g">G</span><span>${state.busy ? "جارٍ تسجيل الدخول..." : "المتابعة باستخدام Google"}</span><span>←</span>
         </button>
-        <button class="student-code-button" type="button" data-action="toggle-code-login" ${state.busy ? "disabled" : ""}>
-          <span>⌘</span><span>دخول الطالب بالكود</span><span>←</span>
-        </button>
-        ${state.codeLoginOpen ? `<form class="student-code-form" data-form="student-code-login">
-          <label for="student-login-code">كود الدخول الرقمي</label>
-          <input id="student-login-code" name="loginCode" type="text" inputmode="numeric" pattern="[0-9٠-٩۰-۹]{14}" maxlength="14" autocomplete="one-time-code" required placeholder="اكتب الـ 14 رقماً">
-          ${state.codeLoginError ? `<div class="inline-error">${h(state.codeLoginError)}</div>` : ""}
-          <small>الكود خاص بحسابك؛ لا تشاركه مع الآخرين.</small>
-          <small>لو كودك القديم يحتوي حروفاً، سجّل دخول Google مرة واحدة للحصول على كود رقمي.</small>
-          <button class="button button-primary button-wide" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ التحقق..." : "دخول الطالب"}</button>
-        </form>` : ""}
         <div class="admin-login">
           <button class="admin-login-button" type="button" data-action="admin-login" ${state.busy ? "disabled" : ""}>
             <span>♢</span><span>${state.busy && state.adminLoginRequested ? "جارٍ التحقق من حساب المشرف..." : "تسجيل دخول المشرف عبر Google"}</span><span class="admin-chevron">←</span>
@@ -530,7 +500,7 @@ function sidebar() {
     <nav class="side-nav">${items.map(([id, label, icon]) => `<button class="nav-item ${state.nav === id ? "active" : ""}" data-nav="${id}"><span class="nav-icon">${icon}</span><span>${h(label)}</span>${id === "updates" && state.announcements.length ? `<span class="nav-count">${state.announcements.length}</span>` : ""}</button>`).join("")}</nav>
     <div class="sidebar-bottom"><div class="side-promo"><div class="promo-orb">✦</div><strong>مستقبلك يبدأ هنا</strong><span>خطوة صغيرة كل يوم تصنع فرقاً كبيراً.</span></div>
     ${state.installPrompt ? `<button class="install-link" data-action="install">▣ ثبّت التطبيق</button>` : ""}
-    <button class="profile-mini" data-action="profile"><span class="avatar">${h(displayName().slice(0, 1))}</span><span class="mini-name"><b>${h(displayName())}</b><small>${state.admin ? "مشرف المنصة" : h(state.profile?.loginCode)}</small></span><span>⌄</span></button></div></aside>`;
+    <button class="profile-mini" data-action="profile"><span class="avatar">${h(displayName().slice(0, 1))}</span><span class="mini-name"><b>${h(displayName())}</b><small>${state.admin ? "مشرف المنصة" : h(state.profile?.studentCode || "طالب")}</small></span><span>⌄</span></button></div></aside>`;
 }
 
 function displayName() {
@@ -670,7 +640,7 @@ function chatView(support) {
   const description = support
     ? (state.admin ? "هذه المحادثة خاصة بينك وبين الطالب." : "رسالتك خاصة ولا يراها إلا فريق الإشراف. سيصلك رد خلال 24 ساعة.")
     : "تواصل مع زملائك في مساحة واحدة. تُحذف الرسائل بعد 24 ساعة.";
-  const targetSelector = support && state.admin ? `<div class="support-select"><label for="support-student">اختر الطالب للتواصل</label><select id="support-student" data-change="support-target"><option value="">اختر حساباً</option>${state.students.map((student) => `<option value="${h(student.id)}" ${state.supportTarget === student.id ? "selected" : ""}>${h(student.fullName)} · ${h(student.loginCode || student.studentCode)}</option>`).join("")}</select></div>` : "";
+  const targetSelector = support && state.admin ? `<div class="support-select"><label for="support-student">اختر الطالب للتواصل</label><select id="support-student" data-change="support-target"><option value="">اختر حساباً</option>${state.students.map((student) => `<option value="${h(student.id)}" ${state.supportTarget === student.id ? "selected" : ""}>${h(student.fullName)} · ${h(student.studentCode)}</option>`).join("")}</select></div>` : "";
   return `<section class="chat-page">${targetSelector}<div class="page-title-row"><div><span class="eyebrow">مساحة التواصل</span><h1>${title}</h1><p>${description}</p></div><span class="privacy-badge">♢ ${support ? "محادثة خاصة" : "رسائل مؤقتة"}</span></div>
     <div class="chat-card"><div class="chat-head"><div class="chat-head-icon">◌</div><div><b>${title}</b><small>${support ? "بين المشرف والطالب فقط" : "تُحذف الرسائل تلقائياً بعد 24 ساعة"}</small></div><span class="online-dot"></span></div>
     <div class="chat-stream">${state.chatMessages.length ? state.chatMessages.map((message) => `<div class="chat-message ${message.kind === "system" ? "system-message" : message.senderId === state.user.uid ? "mine" : ""}"><div class="message-meta"><b>${h(message.senderName)}</b><small>${h(timestampText(message.createdAt, true))}</small></div><p>${h(message.text)}</p>${state.admin && message.kind !== "system" ? `<button class="message-delete" data-delete-message="${h(message.id)}">×</button>` : ""}</div>`).join("") : emptyState("◌", "ابدأ المحادثة", state.admin && support && !state.supportTarget ? "اختر حساب طالب أولاً." : "اكتب أول رسالة وابدأ التواصل.")}</div>
@@ -684,21 +654,19 @@ function announcementsView() {
 }
 
 function adminView() {
-  const students = state.students.map((student) => ({ ...student, activeDevices: state.deviceCounts[student.id] || 0 }))
-    .filter((student) => `${student.fullName} ${student.phone} ${student.studentCode} ${student.loginCode} ${student.email || ""}`.toLowerCase().includes(state.search.toLowerCase()));
-  return `<div class="admin-page"><div class="page-title-row"><div><span class="eyebrow">مركز التحكم</span><h1>إدارة المنصة</h1><p>تابع الحسابات وطلبات الأجهزة، وأدر محتوى الطلاب.</p></div><span class="admin-badge">♢ صلاحيات المشرف</span></div>
-    <div class="admin-metrics">${statCard("♧", "حسابات مسجلة", String(state.students.length).padStart(2, "0"), "طلاب على المنصة", "cyan")}${statCard("▣", "طلبات الأجهزة", String(state.deviceRequests.length).padStart(2, "0"), "بانتظار المراجعة", "purple")}${statCard("▤", "منصات تعليمية", String(state.courses.length).padStart(2, "0"), "في مكتبة المحتوى", "blue")}</div>
-    <section class="panel device-requests"><div class="panel-heading"><div><span class="eyebrow">التحكم في الوصول</span><h2>طلبات تسجيل جهاز إضافي</h2></div>${state.deviceRequests.length ? `<button class="text-button" data-action="allow-all">السماح للكل ✓</button>` : ""}</div>
-      ${state.deviceRequests.length ? state.deviceRequests.map((request) => { const student = state.students.find((item) => item.id === request.uid); return `<div class="request-row"><span class="request-icon">▣</span><div><b>${h(student?.fullName || "طالب")}</b><small>${h(student?.loginCode || request.uid)}</small></div><div class="request-actions"><button class="button button-outline button-small" data-review="${h(request.id)}" data-approve="false">رفض</button><button class="button button-primary button-small" data-review="${h(request.id)}" data-approve="true">موافقة</button></div></div>`; }).join("") : emptyState("✓", "لا توجد طلبات معلقة", "طلبات الأجهزة الجديدة ستظهر هنا.")}</section>
+  const students = state.students
+    .filter((student) => `${student.fullName} ${student.phone} ${student.studentCode} ${student.email || ""}`.toLowerCase().includes(state.search.toLowerCase()));
+  return `<div class="admin-page"><div class="page-title-row"><div><span class="eyebrow">مركز التحكم</span><h1>إدارة المنصة</h1><p>تابع حسابات الطلاب وأدر محتوى المنصة.</p></div><span class="admin-badge">♢ صلاحيات المشرف</span></div>
+    <div class="admin-metrics">${statCard("♧", "حسابات مسجلة", String(state.students.length).padStart(2, "0"), "طلاب على المنصة", "cyan")}${statCard("G", "تسجيل الطلاب", "Google", "حساب مرتبط بالطالب", "purple")}${statCard("▤", "منصات تعليمية", String(state.courses.length).padStart(2, "0"), "في مكتبة المحتوى", "blue")}</div>
     <section class="panel students-panel"><div class="panel-heading"><div><span class="eyebrow">قاعدة الحسابات</span><h2>حسابات الطلاب</h2></div><div class="search-field"><span>⌕</span><input data-change="search" value="${h(state.search)}" placeholder="ابحث بالاسم أو الكود"></div></div>
-    <div class="student-table-wrap"><table class="student-table"><thead><tr><th>الطالب والبريد</th><th>كود الدخول</th><th>الهاتف</th><th>الصف / المسار</th><th>الأجهزة</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>${students.map((student) => `<tr><td><div class="student-name"><span class="avatar tiny">${h(student.fullName?.slice(0, 1))}</span><span class="student-identity"><b>${h(student.fullName)}</b><small>${h(student.email)}</small></span></div></td><td><span class="code">${h(student.loginCode || "—")}</span></td><td dir="ltr">${h(student.phone)}</td><td>${h(student.grade)} · ${h(student.track)}</td><td>${student.activeDevices} / 2</td><td><span class="status-pill ${student.isActive ? "status-active" : "status-banned"}">${student.isActive ? "نشط" : "محظور"}</span></td><td><div class="table-actions"><button title="إنهاء الجلسات" data-clear-devices="${h(student.id)}">▣</button><button title="تحذير" data-warning="${h(student.id)}">▧</button>${student.isActive ? `<button class="danger-icon" title="حظر" data-ban="${h(student.id)}">♢</button>` : ""}</div></td></tr>`).join("")}</tbody></table>${students.length ? "" : emptyState("♧", "لا توجد حسابات", "ستظهر الحسابات المسجلة هنا.")}</div></section></div>`;
+    <div class="student-table-wrap"><table class="student-table"><thead><tr><th>الطالب والبريد</th><th>كود الدعوة</th><th>الهاتف</th><th>الصف / المسار</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>${students.map((student) => `<tr><td><div class="student-name"><span class="avatar tiny">${h(student.fullName?.slice(0, 1))}</span><span class="student-identity"><b>${h(student.fullName)}</b><small>${h(student.email)}</small></span></div></td><td><span class="code">${h(student.studentCode || "—")}</span></td><td dir="ltr">${h(student.phone)}</td><td>${h(student.grade)} · ${h(student.track)}</td><td><span class="status-pill ${student.isActive ? "status-active" : "status-banned"}">${student.isActive ? "نشط" : "محظور"}</span></td><td><div class="table-actions"><button title="تحذير" data-warning="${h(student.id)}">▧</button>${student.isActive ? `<button class="danger-icon" title="حظر" data-ban="${h(student.id)}">♢</button>` : ""}</div></td></tr>`).join("")}</tbody></table>${students.length ? "" : emptyState("♧", "لا توجد حسابات", "ستظهر الحسابات المسجلة هنا.")}</div></section></div>`;
 }
 
 function modalView() {
   if (!state.modal) return "";
   if (state.modal === "profile") {
     return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>إعدادات الحساب</h2><button class="icon-button" data-action="close-modal">×</button></div>
-      ${state.admin ? `<div class="profile-details"><div><span>الحساب</span><b>${h(state.user.email || "دخول آمن للمشرف")}</b></div><div><span>الدور</span><b>مشرف AF MASTER</b></div><button class="button button-outline" data-action="logout">تسجيل الخروج</button></div>` : `<form class="form-grid" data-form="school-info"><p class="muted">كود الدخول السري: <b class="code">${h(state.profile.loginCode || "—")}</b></p><small>احتفظ بالكود ولا تشاركه؛ يستخدم للدخول إلى حسابك.</small><label>الصف الدراسي<select name="grade">${gradeOptions(state.profile.grade)}</select></label><label>المسار<select name="track">${trackOptions(state.profile.track)}</select></label><button class="button button-primary">حفظ التعديلات</button></form>`}</section></div>`;
+      ${state.admin ? `<div class="profile-details"><div><span>الحساب</span><b>${h(state.user.email || "دخول آمن للمشرف")}</b></div><div><span>الدور</span><b>مشرف AF MASTER</b></div><button class="button button-outline" data-action="logout">تسجيل الخروج</button></div>` : `<form class="form-grid" data-form="school-info"><p class="muted">كود الدعوة: <b class="code">${h(state.profile.studentCode || "—")}</b></p><small>سجّل الدخول إلى حسابك باستخدام Google.</small><label>الصف الدراسي<select name="grade">${gradeOptions(state.profile.grade)}</select></label><label>المسار<select name="track">${trackOptions(state.profile.track)}</select></label><button class="button button-primary">حفظ التعديلات</button></form>`}</section></div>`;
   }
   if (state.modal === "course") {
     return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>إضافة منصة جديدة</h2><button class="icon-button" data-action="close-modal">×</button></div><form class="form-grid" data-form="course"><label>اسم المنصة<input name="title" required placeholder="مثال: منصة الرياضيات"></label><label>وصف مختصر<input name="description" placeholder="محتوى المنصة"></label><div class="form-row"><label>الصف<select name="grade">${gradeOptions()}</select></label><label>المسار<select name="track">${trackOptions()}</select></label></div><button class="button button-primary">＋ إضافة المنصة</button></form></section></div>`;
@@ -729,35 +697,81 @@ async function handleSubmit(event) {
   state.busy = true;
   state.error = "";
   state.adminLoginError = "";
-  state.codeLoginError = "";
   render();
   try {
     switch (form.dataset.form) {
-      case "student-code-login": {
-        const loginCode = latinDigits(data.loginCode).replace(/\s/g, "");
-        const result = await call("loginStudentWithCode", { loginCode });
-        await signInWithCustomToken(auth, result.token);
-        state.codeLoginOpen = false;
-        break;
-      }
       case "register": {
-        const registration = await call("registerStudent", {
-          fullName: data.fullName,
-          phone: data.phone,
-          grade: data.grade,
-          track: data.track,
-          referralCode: state.referralCode,
+        const fullName = normalizeStudentName(data.fullName);
+        const normalizedName = fullName.toLowerCase();
+        const phone = latinDigits(data.phone).replace(/[^\d+]/g, "");
+        const grade = String(data.grade || "");
+        const track = String(data.track || "");
+        if (fullName.split(" ").length < 3 || fullName.length < 8 || fullName.includes("/")) {
+          throw new Error("اكتب اسمك الثلاثي على الأقل.");
+        }
+        if (!/^\+?\d{8,15}$/.test(phone)) throw new Error("أدخل رقم هاتف صحيحاً.");
+        if (!grades.includes(grade)) throw new Error("اختر صفاً دراسياً صحيحاً.");
+        if (!tracks.includes(track)) throw new Error("اختر المسار الدراسي.");
+        if (!state.user || adminUids.includes(state.user.uid)) {
+          throw new Error("لا يمكن إنشاء حساب طالب بهذا الحساب.");
+        }
+
+        let referredByUid = null;
+        const referralCodeUsed = state.referralCode.trim().toUpperCase() || null;
+        if (referralCodeUsed) {
+          if (!/^AF[A-F0-9]{8}$/.test(referralCodeUsed)) {
+            throw new Error("كود الدعوة غير صالح.");
+          }
+          const referralSnapshot = await getDoc(doc(db, "referralCodes", referralCodeUsed));
+          if (!referralSnapshot.exists()) throw new Error("كود الدعوة غير موجود.");
+          referredByUid = referralSnapshot.data().uid;
+          if (!referredByUid || referredByUid === state.user.uid) {
+            throw new Error("لا يمكن استخدام كود الدعوة الخاص بحسابك.");
+          }
+        }
+
+        const studentCode = createStudentCode();
+        const profileRef = doc(db, "profiles", state.user.uid);
+        const batch = writeBatch(db);
+        batch.set(profileRef, {
+          uid: state.user.uid,
+          fullName,
+          normalizedName,
+          email: state.user.email || "",
+          phone,
+          grade,
+          track,
+          studentCode,
+          referredByUid,
+          referralCodeUsed,
+          isActive: true,
+          referralCount: 0,
+          createdAt: serverTimestamp(),
         });
-        profileCreatedDuringSession = true;
-        const profile = await getDoc(doc(db, "profiles", state.user.uid));
-        if (profile.exists()) state.profile = profile.data();
-        const session = await call("registerDevice", {
-          deviceId: getDeviceId(),
-          label: navigator.userAgent.slice(0, 96),
+        batch.set(doc(db, "phoneNumbers", phone), {
+          uid: state.user.uid,
+          createdAt: serverTimestamp(),
         });
-        if (session.status === "pending") state.device = session;
-        else if (session.token) await signInWithCustomToken(auth, session.token);
-        notify(`تم إنشاء حسابك. كود الدخول السري: ${registration.loginCode} — احتفظ به ولا تشاركه.`);
+        batch.set(doc(db, "profileNames", normalizedName), { uid: state.user.uid });
+        batch.set(doc(db, "referralCodes", studentCode), { uid: state.user.uid });
+        if (referredByUid && referralCodeUsed) {
+          batch.set(doc(db, "profiles", referredByUid, "referrals", state.user.uid), {
+            referredUid: state.user.uid,
+            referralCode: referralCodeUsed,
+            createdAt: serverTimestamp(),
+          });
+          batch.update(doc(db, "profiles", referredByUid), {
+            referralCount: increment(1),
+          });
+        }
+        await batch.commit();
+        const profile = await getDoc(profileRef);
+        if (!profile.exists()) throw new Error("تم الحفظ لكن تعذر تحميل بيانات الحساب. أعد تحميل الصفحة.");
+        state.profile = profile.data();
+        state.device = { status: "active" };
+        listenProfile(state.user.uid);
+        listenSharedData();
+        notify("تم إنشاء حسابك بنجاح.");
         break;
       }
       case "chat":
@@ -803,7 +817,14 @@ async function handleSubmit(event) {
         break;
       }
       case "school-info":
-        await call("updateSchoolInfo", { grade: data.grade, track: data.track });
+        if (!grades.includes(String(data.grade)) || !tracks.includes(String(data.track))) {
+          throw new Error("اختر الصف والمسار الدراسيين.");
+        }
+        await updateDoc(doc(db, "profiles", state.user.uid), {
+          grade: data.grade,
+          track: data.track,
+        });
+        state.profile = { ...state.profile, grade: data.grade, track: data.track };
         state.modal = "";
         notify("تم تحديث الصف والمسار الدراسي.");
         break;
@@ -816,13 +837,9 @@ async function handleSubmit(event) {
     }
   } catch (error) {
     console.error(`AF MASTER form submission failed (${form.dataset.form}).`, error);
-    if (form.dataset.form === "student-code-login") {
-      state.codeLoginError = error?.code?.includes("unauthenticated")
-        ? "كود الدخول غير صحيح أو الحساب غير متاح."
-        : messageFromError(error);
-    } else {
-      state.error = messageFromError(error);
-    }
+    state.error = form.dataset.form === "register" && error?.code === "permission-denied"
+      ? "الاسم أو رقم الهاتف مستخدم بالفعل، أو لم تُنشر قواعد التسجيل الجديدة في Firestore."
+      : messageFromError(error);
   } finally {
     state.busy = false;
     render();
@@ -889,11 +906,6 @@ async function clickAction(action, target, originalTarget) {
     case "admin-login":
       await loginWithGoogle(true);
       break;
-    case "toggle-code-login":
-      state.codeLoginOpen = !state.codeLoginOpen;
-      state.codeLoginError = "";
-      render();
-      break;
     case "logout": await logout(); break;
     case "dismiss": state.error = ""; state.notice = ""; render(); break;
     case "profile": state.modal = "profile"; render(); break;
@@ -928,18 +940,8 @@ async function clickAction(action, target, originalTarget) {
       render();
       break;
     }
-    case "allow-all":
-      for (const request of state.deviceRequests) await reviewDevice(request.id, true);
-      break;
     default: break;
   }
-}
-
-async function reviewDevice(requestId, approve) {
-  try {
-    await call("reviewDeviceRequest", { requestId, approve });
-    notify(approve ? "تمت الموافقة على الجهاز." : "تم رفض طلب الجهاز.");
-  } catch (error) { fail(error); }
 }
 
 async function moderateStudent(uid, ban) {
@@ -1013,25 +1015,10 @@ async function handleClick(event) {
     } catch (error) { fail(error); }
     return;
   }
-  const reviewButton = event.target.closest("[data-review]");
-  if (reviewButton) {
-    await reviewDevice(reviewButton.dataset.review, reviewButton.dataset.approve === "true");
-    return;
-  }
   const banButton = event.target.closest("[data-ban]");
   if (banButton) { await moderateStudent(banButton.dataset.ban, true); return; }
   const warningButton = event.target.closest("[data-warning]");
   if (warningButton) { await moderateStudent(warningButton.dataset.warning, false); return; }
-  const clearDevicesButton = event.target.closest("[data-clear-devices]");
-  if (clearDevicesButton) {
-    const student = state.students.find((item) => item.id === clearDevicesButton.dataset.clearDevices);
-    if (!student || !window.confirm(`إنهاء جميع جلسات الأجهزة للطالب ${student.fullName}؟`)) return;
-    try {
-      await call("clearStudentDevices", { uid: student.id });
-      notify("تم إنهاء جميع جلسات الطالب.");
-    } catch (error) { fail(error); }
-    return;
-  }
   const action = event.target.closest("[data-action]");
   if (action) await clickAction(action.dataset.action, action, event.target);
 }
@@ -1079,30 +1066,19 @@ if (state.introVisible) {
   introOverlay.hidden = false;
   introOverlay.setAttribute("aria-hidden", "false");
   introVideo.addEventListener("ended", finishIntro, { once: true });
-  introVideo.addEventListener("error", finishIntro, { once: true });
-  introFallbackTimer = window.setTimeout(finishIntro, 60_000);
-  introVideo.play().catch((error) => {
-    console.warn("Intro video autoplay was blocked.", error);
-    introVideo.controls = true;
-    introSoundButton.textContent = "تشغيل الفيديو";
+  introVideo.addEventListener("error", () => {
+    showIntroStart("تعذر تحميل الفيديو. تحقق من اتصالك ثم أعد المحاولة.", "إعادة محاولة تشغيل المقدمة");
   });
+  playIntro();
 } else {
   introOverlay.hidden = true;
   introOverlay.setAttribute("aria-hidden", "true");
   introVideo.pause();
 }
 
-document.querySelector("#intro-skip").addEventListener("click", finishIntro);
-introSoundButton.addEventListener("click", () => {
-  if (introVideo.paused) {
-    introVideo.controls = false;
-    introVideo.muted = true;
-    introVideo.play().catch((error) => console.error("Intro video playback failed.", error));
-    introSoundButton.textContent = "تشغيل الصوت";
-    return;
-  }
-  introVideo.muted = !introVideo.muted;
-  introSoundButton.textContent = introVideo.muted ? "تشغيل الصوت" : "كتم الصوت";
+introStartButton.addEventListener("click", () => {
+  if (introVideo.error) introVideo.load();
+  playIntro();
 });
 
 render();

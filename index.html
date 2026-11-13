@@ -13,14 +13,14 @@
   <body>
     <div id="root"><div class="center-screen"><div class="loading-mark"><img src="./logo.jpeg" alt="AF MASTER"><span class="spinner"></span></div></div></div>
     <div id="intro-overlay" class="intro-overlay" aria-label="مقدمة AF MASTER">
-      <video id="intro-video" autoplay muted playsinline preload="auto" poster="./logo.jpeg">
+      <video id="intro-video" autoplay playsinline preload="auto" poster="./logo.jpeg">
         <source src="./WhatsApp%20Video%202026-11-12%20at%2011.29.58%20PM.mp4" type="video/mp4">
       </video>
       <div class="intro-shade"></div>
       <div class="intro-brand"><img src="./logo.jpeg" alt=""><span><b>AF MASTER</b><small>LEARN • GROW • WIN</small></span></div>
       <div class="intro-actions">
-        <button id="intro-sound" class="intro-control" type="button">تشغيل الصوت</button>
-        <button id="intro-skip" class="intro-control intro-skip" type="button">تخطي المقدمة ←</button>
+        <p id="intro-message" class="intro-message" aria-live="polite"></p>
+        <button id="intro-start" class="intro-control" type="button" hidden>تشغيل المقدمة بالصوت</button>
       </div>
     </div>
     <script type="module" src="./app.js"></script>
