@@ -302,6 +302,56 @@ function courseMatchesProfile(course) {
   return gradeMatch && trackMatch;
 }
 
+function courseAudienceKeys(course) {
+  const allowedGrades = normalizeCourseFilterValues(course.grade);
+  const allowedTracks = normalizeCourseFilterValues(course.track);
+  const expandedTracks = allowedTracks.includes("كلاهما") ? tracks : allowedTracks;
+  return allowedGrades.flatMap((grade) =>
+    expandedTracks.map((track) => `${grade}|${track}`));
+}
+
+function currentAudienceKey(profile) {
+  return `${profile.grade}|${profile.track}`;
+}
+
+const audienceMigrations = new Set();
+const migratedAudienceCourses = new Set();
+async function migrateCourseAudience(course) {
+  const audienceKeys = courseAudienceKeys(course);
+  const migrationKey = `${course.id}:${JSON.stringify(audienceKeys)}`;
+  if (!audienceKeys.length || audienceMigrations.has(migrationKey) || migratedAudienceCourses.has(migrationKey)) return;
+  audienceMigrations.add(migrationKey);
+  try {
+    const updates = [];
+    if (JSON.stringify(course.audienceKeys || []) !== JSON.stringify(audienceKeys)) {
+      updates.push(updateDoc(doc(db, "courses", course.id), { audienceKeys }));
+    }
+    const [chapters, lessons] = await Promise.all([
+      getDocs(query(collection(db, "chapters"), where("courseId", "==", course.id))),
+      getDocs(query(collection(db, "lessons"), where("courseId", "==", course.id))),
+    ]);
+    for (const [collectionName, snapshot] of [["chapters", chapters], ["lessons", lessons]]) {
+      for (let offset = 0; offset < snapshot.docs.length; offset += 450) {
+        const batch = writeBatch(db);
+        let changed = false;
+        for (const item of snapshot.docs.slice(offset, offset + 450)) {
+          if (JSON.stringify(item.data().audienceKeys || []) === JSON.stringify(audienceKeys)) continue;
+          batch.update(item.ref, { audienceKeys });
+          changed = true;
+        }
+        if (changed) updates.push(batch.commit());
+      }
+    }
+    await Promise.all(updates);
+    migratedAudienceCourses.add(migrationKey);
+  } catch (error) {
+    console.error(`Could not update audience filters for course ${course.id}.`, error);
+    fail(error);
+  } finally {
+    audienceMigrations.delete(migrationKey);
+  }
+}
+
 function learnCatalogCount() {
   return Math.max(Number(state.catalogCount || 0), state.courses.length || 0, 8);
 }
@@ -488,25 +538,17 @@ function listenStudentLoginCode(uid) {
 }
 
 function listenAnnouncements() {
-  listen("announcements", query(
-    collection(db, "announcements"),
-    where("expiresAt", ">", new Date()),
-    orderBy("expiresAt", "asc"),
-  ), (snapshot) => {
+  const announcementsQuery = state.admin
+    ? query(collection(db, "announcements"), orderBy("createdAt", "desc"))
+    : query(
+      collection(db, "announcements"),
+      where("hidden", "==", false),
+      orderBy("createdAt", "desc"),
+    );
+  listen("announcements", announcementsQuery, (snapshot) => {
     state.announcements = snapshot.docs
-      .filter((item) => item.data().hidden !== true)
+        .filter((item) => state.admin || item.data().hidden !== true)
       .map((item) => ({ id: item.id, ...item.data() }));
-    window.clearTimeout(announcementExpiryTimer);
-    const nextExpiry = state.announcements
-      .map((announcement) => announcement.expiresAt?.toMillis?.() || 0)
-      .filter((timestamp) => timestamp > Date.now())
-      .sort((a, b) => a - b)[0];
-    if (nextExpiry) {
-      announcementExpiryTimer = window.setTimeout(
-        listenAnnouncements,
-        Math.max(0, nextExpiry - Date.now() + 50),
-      );
-    }
     if (state.nav === "updates" && !state.admin) markAnnouncementsSeen();
     render();
   });
@@ -519,24 +561,26 @@ function listenSharedData() {
     state.announcements = [];
     window.clearTimeout(announcementExpiryTimer);
     announcementExpiryTimer = null;
-    for (const key of ["courses", "announcements"]) {
-      unsubscribers.get(key)?.();
-      unsubscribers.delete(key);
+    for (const key of [...unsubscribers.keys()]) {
+      if (key === "announcements" || key === "courses" || key === "courses-student") {
+        unsubscribers.get(key)?.();
+        unsubscribers.delete(key);
+      }
     }
     return;
   }
   const canReadCourses = state.admin || Number(state.profile.whatsappShareCount || 0) >= 10;
+  for (const key of [...unsubscribers.keys()]) {
+    if (key === "courses" || key === "courses-student") {
+      unsubscribers.get(key)?.();
+      unsubscribers.delete(key);
+    }
+  }
   if (!canReadCourses) {
     state.courses = [];
     state.catalogCount = Math.max(state.catalogCount, learnCatalogCount());
-    unsubscribers.get("courses")?.();
-    unsubscribers.delete("courses");
   } else {
-    const coursesQuery = state.admin
-      ? query(collection(db, "courses"), orderBy("createdAt", "desc"))
-      : query(collection(db, "courses"), orderBy("createdAt", "desc"));
-    listen("courses", coursesQuery, (snapshot) => {
-      const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+    const updateCourses = (records) => {
       state.courses = state.admin ? records : records.filter((course) => courseMatchesProfile(course));
       state.catalogCount = Math.max(state.catalogCount, state.courses.length || 0);
       if (state.selectedCourse) {
@@ -548,7 +592,22 @@ function listenSharedData() {
         }
       }
       render();
-    });
+    };
+    if (state.admin) {
+      listen("courses", query(collection(db, "courses"), orderBy("createdAt", "desc")), (snapshot) => {
+        const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+        records.forEach((course) => migrateCourseAudience(course));
+        updateCourses(records);
+      });
+    } else {
+      listen("courses-student", query(
+        collection(db, "courses"),
+        where("audienceKeys", "array-contains", currentAudienceKey(state.profile)),
+        orderBy("createdAt", "desc"),
+      ), (snapshot) => {
+        updateCourses(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      });
+    }
   }
   listenAnnouncements();
 
@@ -595,16 +654,21 @@ function listenLessons(course) {
   state.chapters = [];
   state.lessons = [];
   const courseFilters = [where("courseId", "==", course.id)];
+  if (!state.admin && state.profile) {
+    courseFilters.push(where("audienceKeys", "array-contains", currentAudienceKey(state.profile)));
+  }
   listen("chapters", query(collection(db, "chapters"), ...courseFilters), (snapshot) => {
     state.chapters = snapshot.docs
       .map((item) => ({ id: item.id, ...item.data() }))
       .sort((a, b) => Number(a.number) - Number(b.number)
         || Number(a.type === "exam") - Number(b.type === "exam"));
+    if (state.admin) migrateCourseAudience(course);
     sortCourseLessons();
     render();
   });
   listen("lessons", query(collection(db, "lessons"), ...courseFilters), (snapshot) => {
     state.lessons = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+    if (state.admin) migrateCourseAudience(course);
     sortCourseLessons();
     render();
   });
@@ -636,7 +700,7 @@ function sortCourseLessons() {
   });
 }
 
-function listenChat() {
+function listenChat(preserveMessages = false) {
   if (!state.user || (!state.admin && !state.profile?.isActive)) return;
   if (state.nav !== "chat" && state.nav !== "support") return;
   if (state.nav !== "support") {
@@ -651,7 +715,7 @@ function listenChat() {
   chatExpiryTimer = null;
   window.clearTimeout(supportReplyTimer);
   supportReplyTimer = null;
-  state.chatMessages = [];
+  if (!preserveMessages) state.chatMessages = [];
   state.supportRoom = null;
   state.supportDraftOpen = false;
   const roomId = state.nav === "chat"
@@ -681,8 +745,19 @@ function listenChat() {
   const messages = collection(db, "chatRooms", roomId, "messages");
   const updateMessages = (documents) => {
     const previousStream = root.querySelector(".chat-stream");
+    const previousTop = previousStream?.scrollTop || 0;
     const wasNearBottom = !previousStream
-      || previousStream.scrollHeight - previousStream.scrollTop - previousStream.clientHeight < 100;
+      || previousStream.scrollHeight - previousTop - previousStream.clientHeight < 100;
+    const streamTop = previousStream?.getBoundingClientRect().top || 0;
+    const visibleAnchors = previousStream
+      ? [...previousStream.querySelectorAll("[data-chat-message]")]
+        .map((element) => ({
+          id: element.dataset.chatMessage,
+          offset: element.getBoundingClientRect().top - streamTop,
+          bottom: element.getBoundingClientRect().bottom,
+        }))
+        .filter((anchor) => anchor.bottom > streamTop)
+      : [];
     state.chatMessages = documents.map((item) => ({ id: item.id, ...item.data() }))
       .sort((a, b) => (a.createdAt?.toMillis?.() || 0) - (b.createdAt?.toMillis?.() || 0));
     if (state.nav === "support" && !state.admin
@@ -699,6 +774,20 @@ function listenChat() {
     if (wasNearBottom) {
       const currentStream = root.querySelector(".chat-stream");
       if (currentStream) currentStream.scrollTop = currentStream.scrollHeight;
+    } else {
+      const currentStream = root.querySelector(".chat-stream");
+      if (!currentStream) return;
+      const currentTop = currentStream.getBoundingClientRect().top;
+      const currentMessages = [...currentStream.querySelectorAll("[data-chat-message]")];
+      const anchor = visibleAnchors.find((item) =>
+        currentMessages.some((element) => element.dataset.chatMessage === item.id));
+      const currentAnchor = anchor && currentMessages.find((element) =>
+        element.dataset.chatMessage === anchor.id);
+      if (currentAnchor) {
+        currentStream.scrollTop += currentAnchor.getBoundingClientRect().top - currentTop - anchor.offset;
+      } else {
+        currentStream.scrollTop = previousTop;
+      }
     }
   };
   if (state.nav === "support") {
@@ -709,7 +798,9 @@ function listenChat() {
     return;
   }
   const items = [[], []];
+  const received = [false, false];
   const update = () => {
+    if (!received.every(Boolean)) return;
     updateMessages(items.flat()
       .filter((message, index, list) => list.findIndex((item) => item.id === message.id) === index));
     window.clearTimeout(chatExpiryTimer);
@@ -719,13 +810,28 @@ function listenChat() {
       .sort((a, b) => a - b)[0];
     if (nextExpiry) {
       chatExpiryTimer = window.setTimeout(() => {
-        if (state.nav === "chat") listenChat();
+        if (state.nav === "chat") listenChat(true);
       }, Math.max(0, nextExpiry - Date.now() + 50));
     }
   };
-  [where("expiresAt", ">", new Date()), where("expiresAt", "==", null)].forEach((filter, index) => {
-    listen(`chat${index}`, query(messages, filter, orderBy("createdAt", "asc")), (snapshot) => {
+  const chatQueries = [
+    query(
+      messages,
+      where("expiresAt", ">", new Date()),
+      orderBy("expiresAt", "asc"),
+      orderBy("createdAt", "asc"),
+    ),
+    query(
+      messages,
+      where("expiresAt", "==", null),
+      orderBy("expiresAt", "asc"),
+      orderBy("createdAt", "asc"),
+    ),
+  ];
+  chatQueries.forEach((chatQuery, index) => {
+    listen(`chat${index}`, chatQuery, (snapshot) => {
       items[index] = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      received[index] = true;
       update();
     });
   });
@@ -1090,7 +1196,7 @@ function learningView() {
   if (state.selectedCourse) {
     const groups = chapterGroups();
     return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-courses">كل المنصات</button> ← <b>${h(state.selectedCourse.title)}</b></div>
-      <div class="page-title-row course-title-row"><div><span class="eyebrow">${h(courseFilterLabel(state.selectedCourse.grade))} · ${h(courseFilterLabel(state.selectedCourse.track))}</span><h1>${h(state.selectedCourse.title)}</h1><p>${h(state.selectedCourse.description || "اختار الفصل أو المحتوى اللي حابب تراجعه.")}</p></div>${state.admin ? `<div class="course-title-actions"><button class="button button-outline" data-action="edit-course">تعديل المنصة</button><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>` : ""}</div>
+      <div class="page-title-row course-title-row"><div><span class="eyebrow">${h(courseFilterLabel(state.selectedCourse.grade))} · ${h(courseFilterLabel(state.selectedCourse.track))}</span><h1>${h(state.selectedCourse.title)}</h1><p>${h(state.selectedCourse.description || "اختار الفصل أو المحتوى اللي حابب تراجعه.")}</p></div>${state.admin ? `<div class="course-title-actions"><button class="button button-outline" data-action="edit-course">تعديل المنصة</button><button class="button button-outline course-delete-button" data-action="delete-course" ${state.busy ? "disabled" : ""}>حذف المنصة</button><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>` : ""}</div>
       ${groups.length ? `<div class="chapter-list">${groups.map((chapter, chapterIndex) => `<section class="chapter-card"><div class="chapter-title"><span class="chapter-index">${chapter.type === "exam" ? "E" : String(chapter.number || chapterIndex + 1).padStart(2, "0")}</span><div><span class="eyebrow">${chapter.type === "exam" ? "امتحانات" : `الفصل ${chapter.number || chapterIndex + 1}`}</span><h2>${h(chapter.title)}</h2></div><span class="chapter-count">${chapter.lessons.length} محتوى</span>${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-edit" data-action="edit-chapter" data-chapter="${h(chapter.id)}">تعديل الفصل</button>` : ""}</div><div class="chapter-lessons">${chapter.lessons.map((lesson, index) => `<div class="lesson-row-wrap"><button class="lesson-row" data-lesson="${h(lesson.id)}"><span class="lesson-index ${lesson.type === "exam" ? "exam-index" : ""}">${lesson.type === "exam" ? "▣" : String(index + 1).padStart(2, "0")}</span><span class="lesson-row-copy"><b>${h(lesson.title)}</b><small>${lesson.type === "exam" ? "امتحان ومراجعة" : `${lesson.entries?.length || 0} سؤال وإجابة`}</small></span><span>←</span></button>${state.admin ? `<div class="lesson-tools"><button class="text-button" data-action="move-lesson-up" data-lesson="${h(lesson.id)}">↑</button><button class="text-button" data-action="move-lesson-down" data-lesson="${h(lesson.id)}">↓</button><button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل</button><button class="text-button danger" data-action="delete-lesson" data-lesson="${h(lesson.id)}">حذف</button></div>` : ""}</div>`).join("")}${chapter.lessons.length ? "" : `<p class="chapter-empty">لا توجد دروس في هذا الفصل بعد.</p>`}${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-add-lesson" data-action="add-lesson" data-chapter="${h(chapter.id)}">＋ إضافة درس أو امتحان لهذا الفصل</button>` : ""}</div></section>`).join("")}</div>` : emptyState("▤", "لم تُضف فصولاً بعد", "أنشئ فصول المنصة ثم أضف الدروس والامتحانات داخل كل فصل.", state.admin ? `<button class="button button-primary" data-action="add-chapter">＋ إضافة أول فصل</button>` : "")}</div>`;
   }
   return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>اختار منصتك وابدأ</h1><p>محتوى مرتب حسب الصف والمسار الدراسي.</p></div>${state.admin ? `<button class="button button-primary" data-action="add-course">＋ إضافة منصة</button>` : ""}</div>
@@ -1145,10 +1251,10 @@ function chatView(support) {
   const description = support
     ? (state.admin ? "محادثة خاصة دائمة بينك وبين الطالب." : "محادثتك خاصة ومحفوظة كسجل دائم بينك وبين المشرف.")
     : "تواصل مع زملائك في مساحة واحدة. تُحذف رسائل الشات العام بعد 24 ساعة.";
-  return `<section class="chat-page"><div class="page-title-row"><div><span class="eyebrow">مساحة التواصل</span><h1>${h(title)}</h1><p>${description}</p></div><div class="chat-page-actions">${backButton}<span class="privacy-badge">♢ ${support ? "سجل خاص محفوظ" : "رسائل مؤقتة"}</span></div></div>
+  return `<section class="chat-page ${support ? "support-chat" : "student-chat"}"><div class="page-title-row"><div><span class="eyebrow">مساحة التواصل</span><h1>${h(title)}</h1><p>${description}</p></div><div class="chat-page-actions">${backButton}<span class="privacy-badge">♢ ${support ? "سجل خاص محفوظ" : "رسائل مؤقتة"}</span></div></div>
     <div class="chat-card"><div class="chat-head"><div class="chat-head-icon">◌</div><div><b>${h(title)}</b><small>${support ? "سجل المحادثة محفوظ للطرفين" : "تُحذف رسائل الشات العام بعد 24 ساعة"}</small></div><span class="online-dot"></span></div>
     ${supportNotice}
-    <div class="chat-stream">${state.chatMessages.length ? state.chatMessages.map((message) => `<div class="chat-message ${message.kind === "system" ? "system-message" : message.senderId === state.user.uid ? "mine" : ""}"><div class="message-meta"><b>${h(message.senderName)}</b><small>${h(timestampText(message.createdAt, true))}</small></div><p>${h(message.text)}</p>${state.admin && !support && message.kind !== "system" ? `<button class="message-delete" data-delete-message="${h(message.id)}">×</button>` : ""}</div>`).join("") : emptyState("◌", "ابدأ المحادثة", "اكتب أول رسالة وابدأ التواصل.")}</div>
+    <div class="chat-stream" aria-label="رسائل المحادثة">${state.chatMessages.length ? state.chatMessages.map((message) => `<div class="chat-message ${message.kind === "system" ? "system-message" : message.senderId === state.user.uid ? "mine" : "peer"}" data-chat-message="${h(message.id)}"><div class="message-meta"><b>${h(message.senderName)}</b><small>${h(timestampText(message.createdAt, true))}</small></div><p>${h(message.text)}</p>${state.admin && !support && message.kind !== "system" ? `<button class="message-delete" data-delete-message="${h(message.id)}">×</button>` : ""}</div>`).join("") : emptyState("◌", "ابدأ المحادثة", "اكتب أول رسالة وابدأ التواصل.")}</div>
     <form class="chat-composer" data-form="chat"><input name="text" value="${h(state.chatText)}" placeholder="${ended && state.supportDraftOpen ? "اكتب رسالتك لبدء دردشة جديدة..." : "اكتب رسالتك هنا..."}" maxlength="2000" ${!canSend ? "disabled" : ""}><button class="send-button" ${state.busy || !canSend ? "disabled" : ""} aria-label="إرسال الرسالة">➤</button></form></div></section>`;
 }
 
@@ -1168,7 +1274,7 @@ function supportInboxView() {
 function announcementsView() {
   return `<div class="announcements-page"><div class="page-title-row"><div><span class="eyebrow">من فريق AF MASTER</span><h1>الإعلانات والرسائل</h1><p>آخر الأخبار والتنبيهات المهمة للطلاب.</p></div><span class="privacy-badge">▧ ${state.announcements.length} رسالة</span></div>
     ${state.admin ? `<form class="panel announcement-form" data-form="announcement"><h2>إرسال إعلان جديد</h2><div class="form-row"><input name="title" required placeholder="عنوان الإعلان"><button class="button button-primary">إرسال للجميع →</button></div><textarea name="body" required rows="3" placeholder="اكتب رسالتك للطلاب..."></textarea></form>` : ""}
-    ${state.announcements.length ? `<div class="announcement-list full-list">${state.announcements.map((announcement) => `<article class="announcement-card"><span class="announcement-symbol">▧</span><div class="announcement-card-copy"><div class="announcement-meta"><span>رسالة من المشرف</span><small>${h(timestampText(announcement.createdAt))}</small></div><h2>${h(announcement.title)}</h2><p>${h(announcement.body)}</p></div><span class="announcement-read">✓✓ تمت القراءة</span></article>`).join("")}</div>` : emptyState("▧", "لا توجد رسائل حالياً", "ستظهر هنا إعلانات المشرف الجديدة.")}</div>`;
+    ${state.announcements.length ? `<div class="announcement-list full-list">${state.announcements.map((announcement) => `<article class="announcement-card"><span class="announcement-symbol">▧</span><div class="announcement-card-copy"><div class="announcement-meta"><span>${state.admin && announcement.hidden ? "مخفي عن الطلاب" : "رسالة من المشرف"}</span><small>${h(timestampText(announcement.createdAt))}</small></div><h2>${h(announcement.title)}</h2><p>${h(announcement.body)}</p></div>${state.admin ? `<button class="text-button" data-action="toggle-announcement" data-announcement="${h(announcement.id)}">${announcement.hidden ? "إظهار للطلاب" : "إخفاء عن الطلاب"}</button>` : `<span class="announcement-read">✓✓ تمت القراءة</span>`}</article>`).join("")}</div>` : emptyState("▧", "لا توجد رسائل حالياً", "ستظهر هنا إعلانات المشرف الجديدة.")}</div>`;
 }
 
 function adminView() {
@@ -1449,6 +1555,7 @@ async function handleSubmit(event) {
         }
         const gradeValue = selectedGrades.length > 1 ? selectedGrades : selectedGrades[0];
         const trackValue = selectedTracks.length > 1 ? selectedTracks : selectedTracks[0];
+        const audienceKeys = courseAudienceKeys({ grade: gradeValue, track: trackValue });
         let notice;
         if (state.editingCourseId) {
           await updateDoc(doc(db, "courses", state.editingCourseId), {
@@ -1456,9 +1563,17 @@ async function handleSubmit(event) {
             description,
             grade: gradeValue,
             track: trackValue,
+            audienceKeys,
           });
           if (state.selectedCourse?.id === state.editingCourseId) {
-            state.selectedCourse = { ...state.selectedCourse, title, description, grade: gradeValue, track: trackValue };
+            state.selectedCourse = {
+              ...state.selectedCourse,
+              title,
+              description,
+              grade: gradeValue,
+              track: trackValue,
+              audienceKeys,
+            };
           }
           notice = "تم تحديث المنصة.";
         } else {
@@ -1467,6 +1582,7 @@ async function handleSubmit(event) {
             description,
             grade: gradeValue,
             track: trackValue,
+            audienceKeys,
             createdAt: serverTimestamp(),
           });
           notice = "تمت إضافة المنصة بنجاح.";
@@ -1500,6 +1616,7 @@ async function handleSubmit(event) {
             courseId: state.selectedCourse.id,
             grade: state.selectedCourse.grade,
             track: state.selectedCourse.track,
+            audienceKeys: state.selectedCourse.audienceKeys || courseAudienceKeys(state.selectedCourse),
             createdAt: serverTimestamp(),
           });
           state.notice = "تمت إضافة الفصل. يمكنك الآن إضافة الدروس والامتحانات بداخله.";
@@ -1528,6 +1645,7 @@ async function handleSubmit(event) {
           chapterId: chapter.id,
           grade: state.selectedCourse.grade,
           track: state.selectedCourse.track,
+          audienceKeys: state.selectedCourse.audienceKeys || courseAudienceKeys(state.selectedCourse),
           chapterNumber: chapter.number,
           chapterTitle: chapter.title,
           title,
@@ -1572,11 +1690,10 @@ async function handleSubmit(event) {
           title,
           body,
           createdAt: serverTimestamp(),
-          expiresAt: Timestamp.fromDate(new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)),
           createdBy: state.user.uid,
           hidden: false,
         });
-        notify("تم إرسال الإعلان للطلاب. سيُحذف تلقائياً بعد 3 أيام.");
+        notify("تم إرسال الإعلان للطلاب. سيظل ظاهراً حتى يخفيه المشرف.");
         break;
       }
       default:
@@ -1657,6 +1774,25 @@ async function enableStudentCodeLogin() {
   }
 }
 
+async function deleteCourseAndContent(courseId) {
+  const [chapterSnapshot, lessonSnapshot] = await Promise.all([
+    getDocs(query(collection(db, "chapters"), where("courseId", "==", courseId))),
+    getDocs(query(collection(db, "lessons"), where("courseId", "==", courseId))),
+  ]);
+  const contentRefs = [
+    ...chapterSnapshot.docs.map((item) => item.ref),
+    ...lessonSnapshot.docs.map((item) => item.ref),
+  ];
+  for (let offset = 0; offset < contentRefs.length; offset += 450) {
+    const batch = writeBatch(db);
+    for (const contentRef of contentRefs.slice(offset, offset + 450)) {
+      batch.delete(contentRef);
+    }
+    await batch.commit();
+  }
+  await deleteDoc(doc(db, "courses", courseId));
+}
+
 async function clickAction(action, target, originalTarget) {
   switch (action) {
     case "google-login":
@@ -1687,6 +1823,16 @@ async function clickAction(action, target, originalTarget) {
         render();
       }
       break;
+    case "toggle-announcement": {
+      if (!state.admin || !target.dataset.announcement) break;
+      const announcement = state.announcements.find((item) => item.id === target.dataset.announcement);
+      if (!announcement) break;
+      try {
+        await updateDoc(doc(db, "announcements", announcement.id), { hidden: !announcement.hidden });
+        notify(announcement.hidden ? "تم إظهار الإعلان للطلاب." : "تم إخفاء الإعلان عن الطلاب.");
+      } catch (error) { fail(error); }
+      break;
+    }
     case "start-support-chat":
       if (state.admin || state.nav !== "support" || !state.profile?.isActive) break;
       state.supportDraftOpen = true;
@@ -1710,6 +1856,29 @@ async function clickAction(action, target, originalTarget) {
       state.modal = "course";
       render();
       break;
+    case "delete-course": {
+      if (!state.admin || !state.selectedCourse || state.busy) break;
+      const course = state.selectedCourse;
+      if (!window.confirm(`سيتم حذف المنصة "${course.title}" وجميع فصولها ودروسها. هل تريد المتابعة؟`)) break;
+      state.busy = true;
+      state.error = "";
+      render();
+      try {
+        await deleteCourseAndContent(course.id);
+        state.selectedCourse = null;
+        state.selectedChapterId = "";
+        state.selectedLesson = null;
+        listenLessons(null);
+        notify("تم حذف المنصة وفصولها ودروسها.");
+      } catch (error) {
+        console.error(`Could not delete course ${course.id}.`, error);
+        fail(error);
+      } finally {
+        state.busy = false;
+        render();
+      }
+      break;
+    }
     case "edit-chapter":
       if (!state.admin || !state.chapters.some((chapter) => chapter.id === target.dataset.chapter)) break;
       state.editingChapterId = target.dataset.chapter;
@@ -1913,7 +2082,7 @@ async function handleClick(event) {
     render();
     return;
   }
-  const lessonButton = event.target.closest("[data-lesson]");
+  const lessonButton = event.target.closest(".lesson-row[data-lesson]");
   if (lessonButton) {
     state.selectedLesson = state.lessons.find((lesson) => lesson.id === lessonButton.dataset.lesson) || null;
     state.examLessonId = "";
