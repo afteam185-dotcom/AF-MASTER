@@ -18,6 +18,7 @@ import {
   getDoc,
   getDocs,
   increment,
+  limit,
   onSnapshot,
   orderBy,
   query,
@@ -44,6 +45,7 @@ const introStartButton = document.querySelector("#intro-start");
 const introMessage = document.querySelector("#intro-message");
 const grades = ["الأول الثانوي", "الثاني الثانوي", "الثالث الثانوي"];
 const tracks = ["عربي", "لغات"];
+const courseTrackOptions = ["عربي", "لغات", "كلاهما"];
 const state = {
   user: null,
   profile: null,
@@ -59,12 +61,17 @@ const state = {
   notice: "",
   nav: "home",
   courses: [],
+  catalogCount: 0,
   chapters: [],
   lessons: [],
   selectedCourse: null,
   selectedChapterId: "",
   selectedLesson: null,
   chatMessages: [],
+  supportRooms: [],
+  supportRoom: null,
+  supportPreviews: {},
+  supportDraftOpen: false,
   announcements: [],
   warnings: [],
   students: [],
@@ -78,12 +85,17 @@ const state = {
   modal: "",
   editingCourseId: null,
   editingChapterId: null,
+  editingLessonId: null,
   chatText: "",
 };
 
 const unsubscribers = new Map();
 let announcementExpiryTimer = null;
 let chatExpiryTimer = null;
+let supportReplyTimer = null;
+const supportHistoryUpdates = new Set();
+const supportHistoryRooms = new Set();
+const supportPreviewLoads = new Set();
 
 function h(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -265,18 +277,151 @@ function remainingReferrals() {
   return Math.max(10 - Number(state.profile?.whatsappShareCount || 0), 0);
 }
 
+function normalizeCourseFilterValues(value) {
+  if (Array.isArray(value)) return value.filter(Boolean).map((item) => String(item).trim()).filter(Boolean);
+  if (typeof value === "string") {
+    return value.split(/[،,]/).map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function courseFilterLabel(value) {
+  const values = normalizeCourseFilterValues(value);
+  if (!values.length) return "الكل";
+  if (values.length === 1) return values[0];
+  return values.join(" / ");
+}
+
+function courseMatchesProfile(course) {
+  const currentProfile = state.profile;
+  if (!currentProfile) return true;
+  const allowedGrades = normalizeCourseFilterValues(course?.grade);
+  const allowedTracks = normalizeCourseFilterValues(course?.track);
+  const gradeMatch = !allowedGrades.length || allowedGrades.includes(currentProfile.grade);
+  const trackMatch = !allowedTracks.length || allowedTracks.includes(currentProfile.track) || allowedTracks.includes("كلاهما");
+  return gradeMatch && trackMatch;
+}
+
+function learnCatalogCount() {
+  return Math.max(Number(state.catalogCount || 0), state.courses.length || 0, 8);
+}
+
+function studentCommunityCount() {
+  const realCount = Number(state.students?.length || 0);
+  return Math.max(realCount > 0 ? realCount * 3 : 120, 120);
+}
+
 function clearSubscriptions() {
   for (const unsubscribe of unsubscribers.values()) unsubscribe();
   unsubscribers.clear();
   window.clearTimeout(announcementExpiryTimer);
   window.clearTimeout(chatExpiryTimer);
+  window.clearTimeout(supportReplyTimer);
   announcementExpiryTimer = null;
   chatExpiryTimer = null;
+  supportReplyTimer = null;
 }
 
 function listen(key, reference, next, error = fail) {
   unsubscribers.get(key)?.();
   unsubscribers.set(key, onSnapshot(reference, next, error));
+}
+
+function supportReplyDeadline(room) {
+  const repliedAt = room?.adminReplyAt?.toMillis?.();
+  return repliedAt ? repliedAt + 24 * 60 * 60 * 1000 : 0;
+}
+
+function supportReplyExpired(room) {
+  return Boolean(room && room.awaitingAdminReply === false
+    && supportReplyDeadline(room) > 0
+    && supportReplyDeadline(room) <= Date.now());
+}
+
+function scheduleSupportReplyDeadline() {
+  window.clearTimeout(supportReplyTimer);
+  supportReplyTimer = null;
+  const deadline = supportReplyDeadline(state.supportRoom);
+  if (state.supportRoom?.awaitingAdminReply === false && deadline > Date.now()) {
+    supportReplyTimer = window.setTimeout(() => {
+      supportReplyTimer = null;
+      render();
+    }, deadline - Date.now() + 50);
+  }
+}
+
+async function preserveSupportHistory(messages) {
+  const expiring = messages.filter((message) =>
+    message.data().expiresAt != null && !supportHistoryUpdates.has(message.id));
+  for (const message of expiring) supportHistoryUpdates.add(message.id);
+  try {
+    for (let offset = 0; offset < expiring.length; offset += 450) {
+      const batch = writeBatch(db);
+      for (const message of expiring.slice(offset, offset + 450)) {
+        batch.update(message.ref, { expiresAt: null });
+      }
+      await batch.commit();
+    }
+  } catch (error) {
+    console.error("Could not preserve existing support chat history.", error);
+    fail(error);
+    return false;
+  } finally {
+    for (const message of expiring) supportHistoryUpdates.delete(message.id);
+  }
+  return true;
+}
+
+async function preserveSupportRoomHistory(room) {
+  if (supportHistoryRooms.has(room.id)) return;
+  supportHistoryRooms.add(room.id);
+  try {
+    const snapshot = await getDocs(collection(db, "chatRooms", room.id, "messages"));
+    if (!(await preserveSupportHistory(snapshot.docs))) supportHistoryRooms.delete(room.id);
+  } catch (error) {
+    supportHistoryRooms.delete(room.id);
+    console.error(`Could not preserve support history for ${room.id}.`, error);
+    fail(error);
+  }
+}
+
+async function loadSupportPreview(room) {
+  if (room.latestMessage || supportPreviewLoads.has(room.id)) return;
+  supportPreviewLoads.add(room.id);
+  try {
+    const snapshot = await getDocs(query(
+      collection(db, "chatRooms", room.id, "messages"),
+      orderBy("createdAt", "desc"),
+      limit(1),
+    ));
+    const latest = snapshot.docs[0];
+    if (latest) {
+      state.supportPreviews = {
+        ...state.supportPreviews,
+        [room.id]: latest.data(),
+      };
+      render();
+    }
+  } catch (error) {
+    console.error(`Could not load preview for support room ${room.id}.`, error);
+    fail(error);
+  } finally {
+    supportPreviewLoads.delete(room.id);
+  }
+}
+
+function listenSupportInbox() {
+  if (!state.admin) return;
+  listen("support-inbox", query(collection(db, "chatRooms"), orderBy("updatedAt", "desc")), (snapshot) => {
+    state.supportRooms = snapshot.docs
+      .filter((item) => item.data().roomType === "support")
+      .map((item) => ({ id: item.id, ...item.data() }));
+    for (const room of state.supportRooms) {
+      loadSupportPreview(room);
+      preserveSupportRoomHistory(room);
+    }
+    render();
+  });
 }
 
 function listenProfile(uid) {
@@ -290,6 +435,10 @@ function listenProfile(uid) {
       } else {
         state.warnings = [];
         state.chatMessages = [];
+        state.supportRooms = [];
+        state.supportRoom = null;
+        state.supportPreviews = {};
+        state.supportDraftOpen = false;
         state.studentLoginCode = null;
         unsubscribers.get("warnings")?.();
         unsubscribers.delete("warnings");
@@ -299,8 +448,16 @@ function listenProfile(uid) {
           unsubscribers.get(key)?.();
           unsubscribers.delete(key);
         }
+        for (const key of ["support-room", "support-inbox"]) {
+          unsubscribers.get(key)?.();
+          unsubscribers.delete(key);
+        }
+        state.supportRoom = null;
+        state.supportRooms = [];
         window.clearTimeout(chatExpiryTimer);
         chatExpiryTimer = null;
+        window.clearTimeout(supportReplyTimer);
+        supportReplyTimer = null;
       }
       listenSharedData();
     }
@@ -336,7 +493,9 @@ function listenAnnouncements() {
     where("expiresAt", ">", new Date()),
     orderBy("expiresAt", "asc"),
   ), (snapshot) => {
-    state.announcements = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+    state.announcements = snapshot.docs
+      .filter((item) => item.data().hidden !== true)
+      .map((item) => ({ id: item.id, ...item.data() }));
     window.clearTimeout(announcementExpiryTimer);
     const nextExpiry = state.announcements
       .map((announcement) => announcement.expiresAt?.toMillis?.() || 0)
@@ -356,6 +515,7 @@ function listenAnnouncements() {
 function listenSharedData() {
   if (!state.admin && (!state.profile || !state.profile.isActive)) {
     state.courses = [];
+    state.catalogCount = 0;
     state.announcements = [];
     window.clearTimeout(announcementExpiryTimer);
     announcementExpiryTimer = null;
@@ -368,28 +528,27 @@ function listenSharedData() {
   const canReadCourses = state.admin || Number(state.profile.whatsappShareCount || 0) >= 10;
   if (!canReadCourses) {
     state.courses = [];
+    state.catalogCount = Math.max(state.catalogCount, learnCatalogCount());
     unsubscribers.get("courses")?.();
     unsubscribers.delete("courses");
   } else {
-  const coursesQuery = state.admin
-    ? query(collection(db, "courses"), orderBy("createdAt", "desc"))
-    : query(
-      collection(db, "courses"),
-      where("grade", "==", state.profile.grade),
-      where("track", "==", state.profile.track),
-    );
-  listen("courses", coursesQuery, (snapshot) => {
-    state.courses = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-    if (state.selectedCourse) {
-      state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
-      if (!state.selectedCourse) {
-        state.selectedChapterId = "";
-        state.selectedLesson = null;
-        listenLessons(null);
+    const coursesQuery = state.admin
+      ? query(collection(db, "courses"), orderBy("createdAt", "desc"))
+      : query(collection(db, "courses"), orderBy("createdAt", "desc"));
+    listen("courses", coursesQuery, (snapshot) => {
+      const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      state.courses = state.admin ? records : records.filter((course) => courseMatchesProfile(course));
+      state.catalogCount = Math.max(state.catalogCount, state.courses.length || 0);
+      if (state.selectedCourse) {
+        state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
+        if (!state.selectedCourse) {
+          state.selectedChapterId = "";
+          state.selectedLesson = null;
+          listenLessons(null);
+        }
       }
-    }
-    render();
-  });
+      render();
+    });
   }
   listenAnnouncements();
 
@@ -435,11 +594,7 @@ function listenLessons(course) {
   }
   state.chapters = [];
   state.lessons = [];
-  const courseFilters = [
-    where("courseId", "==", course.id),
-    where("grade", "==", course.grade),
-    where("track", "==", course.track),
-  ];
+  const courseFilters = [where("courseId", "==", course.id)];
   listen("chapters", query(collection(db, "chapters"), ...courseFilters), (snapshot) => {
     state.chapters = snapshot.docs
       .map((item) => ({ id: item.id, ...item.data() }))
@@ -472,6 +627,9 @@ function sortCourseLessons() {
     const rankA = chapterRank(a);
     const rankB = chapterRank(b);
     if (rankA !== rankB) return rankA - rankB;
+    const orderA = Number(a.sortOrder ?? a.createdAt?.toMillis?.() ?? 0);
+    const orderB = Number(b.sortOrder ?? b.createdAt?.toMillis?.() ?? 0);
+    if (orderA !== orderB) return orderA - orderB;
     const createdA = a.createdAt?.toMillis?.() || 0;
     const createdB = b.createdAt?.toMillis?.() || 0;
     return createdA - createdB;
@@ -481,26 +639,79 @@ function sortCourseLessons() {
 function listenChat() {
   if (!state.user || (!state.admin && !state.profile?.isActive)) return;
   if (state.nav !== "chat" && state.nav !== "support") return;
+  if (state.nav !== "support") {
+    unsubscribers.get("support-inbox")?.();
+    unsubscribers.delete("support-inbox");
+  }
+  for (const key of ["chat0", "chat1", "support-room"]) {
+    unsubscribers.get(key)?.();
+    unsubscribers.delete(key);
+  }
+  window.clearTimeout(chatExpiryTimer);
+  chatExpiryTimer = null;
+  window.clearTimeout(supportReplyTimer);
+  supportReplyTimer = null;
+  state.chatMessages = [];
+  state.supportRoom = null;
+  state.supportDraftOpen = false;
   const roomId = state.nav === "chat"
     ? "students"
     : `support_${state.admin ? state.supportTarget : state.user.uid}`;
   if (state.nav === "support" && state.admin && !state.supportTarget) {
     state.chatMessages = [];
-    window.clearTimeout(chatExpiryTimer);
-    chatExpiryTimer = null;
-    for (const key of ["chat0", "chat1"]) {
-      unsubscribers.get(key)?.();
-      unsubscribers.delete(key);
-    }
-    render();
+    listenSupportInbox();
     return;
   }
+  unsubscribers.get("support-inbox")?.();
+  unsubscribers.delete("support-inbox");
+  if (state.nav === "support") {
+    listen("support-room", doc(db, "chatRooms", roomId), (snapshot) => {
+      state.supportRoom = snapshot.exists() ? { id: snapshot.id, ...snapshot.data() } : null;
+      if (!state.admin && state.supportRoom?.awaitingAdminReply === false && !state.supportRoom.adminReplyAt) {
+        const lastAdminMessage = [...state.chatMessages].reverse()
+          .find((message) => message.kind === "admin");
+        if (lastAdminMessage?.createdAt) {
+          state.supportRoom = { ...state.supportRoom, adminReplyAt: lastAdminMessage.createdAt };
+        }
+      }
+      scheduleSupportReplyDeadline();
+      render();
+    });
+  }
   const messages = collection(db, "chatRooms", roomId, "messages");
+  const updateMessages = (documents) => {
+    const previousStream = root.querySelector(".chat-stream");
+    const wasNearBottom = !previousStream
+      || previousStream.scrollHeight - previousStream.scrollTop - previousStream.clientHeight < 100;
+    state.chatMessages = documents.map((item) => ({ id: item.id, ...item.data() }))
+      .sort((a, b) => (a.createdAt?.toMillis?.() || 0) - (b.createdAt?.toMillis?.() || 0));
+    if (state.nav === "support" && !state.admin
+      && state.supportRoom?.awaitingAdminReply === false
+      && !state.supportRoom.adminReplyAt) {
+      const lastAdminMessage = [...state.chatMessages].reverse()
+        .find((message) => message.kind === "admin");
+      if (lastAdminMessage?.createdAt) {
+        state.supportRoom = { ...state.supportRoom, adminReplyAt: lastAdminMessage.createdAt };
+        scheduleSupportReplyDeadline();
+      }
+    }
+    render();
+    if (wasNearBottom) {
+      const currentStream = root.querySelector(".chat-stream");
+      if (currentStream) currentStream.scrollTop = currentStream.scrollHeight;
+    }
+  };
+  if (state.nav === "support") {
+    listen("chat0", query(messages, orderBy("createdAt", "asc")), (snapshot) => {
+      updateMessages(snapshot.docs);
+      preserveSupportHistory(snapshot.docs);
+    });
+    return;
+  }
   const items = [[], []];
   const update = () => {
-    state.chatMessages = items.flat()
-      .filter((message, index, list) => list.findIndex((item) => item.id === message.id) === index)
-      .sort((a, b) => (a.createdAt?.toMillis() || 0) - (b.createdAt?.toMillis() || 0));
+    updateMessages(items.flat()
+      .filter((message, index, list) => list.findIndex((item) => item.id === message.id) === index));
     window.clearTimeout(chatExpiryTimer);
     const nextExpiry = state.chatMessages
       .map((message) => message.expiresAt?.toMillis?.() || 0)
@@ -508,16 +719,11 @@ function listenChat() {
       .sort((a, b) => a - b)[0];
     if (nextExpiry) {
       chatExpiryTimer = window.setTimeout(() => {
-        if (state.nav === "chat" || state.nav === "support") listenChat();
+        if (state.nav === "chat") listenChat();
       }, Math.max(0, nextExpiry - Date.now() + 50));
     }
-    render();
   };
-  const filters = [
-    where("expiresAt", ">", new Date()),
-    where("expiresAt", "==", null),
-  ];
-  filters.forEach((filter, index) => {
+  [where("expiresAt", ">", new Date()), where("expiresAt", "==", null)].forEach((filter, index) => {
     listen(`chat${index}`, query(messages, filter, orderBy("createdAt", "asc")), (snapshot) => {
       items[index] = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
       update();
@@ -548,7 +754,7 @@ async function writeChatMessage(value) {
     text,
     kind: isAdminSender ? "admin" : "student",
     createdAt: serverTimestamp(),
-    expiresAt: support && !isAdminSender ? null : expiresAt,
+    expiresAt: support ? null : expiresAt,
   };
 
   if (support && !isAdminSender) {
@@ -563,6 +769,12 @@ async function writeChatMessage(value) {
         studentUid: state.user.uid,
         updatedAt: serverTimestamp(),
         awaitingAdminReply: true,
+        adminReplyAt: null,
+        latestMessage: text,
+        latestMessageAt: serverTimestamp(),
+        latestSenderId: state.user.uid,
+        latestSenderName: state.profile.fullName,
+        lastMessageId: messageRef.id,
       }, { merge: true });
       transaction.set(messageRef, message);
       if (startNewTurn) {
@@ -572,39 +784,33 @@ async function writeChatMessage(value) {
           text: "تم استلام رسالتك، وسيتم الرد عليك خلال 24 ساعة.",
           kind: "system",
           createdAt: serverTimestamp(),
-          expiresAt,
+          expiresAt: null,
         });
       }
     });
+    state.supportDraftOpen = false;
     return;
   }
 
   if (support && isAdminSender) {
-    const [activeSnapshot, pendingSnapshot] = await Promise.all([
-      getDocs(query(messagesRef, where("expiresAt", ">", new Date()))),
-      getDocs(query(messagesRef, where("expiresAt", "==", null))),
-    ]);
-    const priorMessages = new Map();
-    for (const snapshot of [activeSnapshot, pendingSnapshot]) {
-      for (const messageDoc of snapshot.docs) priorMessages.set(messageDoc.id, messageDoc.ref);
-    }
-    const priorRefs = [...priorMessages.values()];
-    for (let offset = 0; offset < priorRefs.length; offset += 400) {
-      const batch = writeBatch(db);
-      for (const messageDocRef of priorRefs.slice(offset, offset + 400)) {
-        batch.update(messageDocRef, { expiresAt });
-      }
-      await batch.commit();
-    }
-    const batch = writeBatch(db);
-    batch.set(doc(db, "chatRooms", roomId), {
-      roomType: "support",
-      studentUid: recipientUid,
-      updatedAt: serverTimestamp(),
-      awaitingAdminReply: false,
-    }, { merge: true });
-    batch.set(messageRef, message);
-    await batch.commit();
+    const roomRef = doc(db, "chatRooms", roomId);
+    await runTransaction(db, async (transaction) => {
+      const roomSnapshot = await transaction.get(roomRef);
+      if (!roomSnapshot.exists()) throw new Error("لم يبدأ الطالب هذه المحادثة بعد.");
+      transaction.set(roomRef, {
+        roomType: "support",
+        studentUid: recipientUid,
+        updatedAt: serverTimestamp(),
+        awaitingAdminReply: false,
+        adminReplyAt: serverTimestamp(),
+        latestMessage: text,
+        latestMessageAt: serverTimestamp(),
+        latestSenderId: state.user.uid,
+        latestSenderName: "مشرف AF MASTER",
+        lastMessageId: messageRef.id,
+      }, { merge: true });
+      transaction.set(messageRef, message);
+    });
     return;
   }
 
@@ -626,6 +832,10 @@ onAuthStateChanged(auth, async (user) => {
   state.selectedChapterId = "";
   state.selectedLesson = null;
   state.chatMessages = [];
+  state.supportRooms = [];
+  state.supportRoom = null;
+  state.supportPreviews = {};
+  state.supportDraftOpen = false;
   if (!user) {
     state.authReady = true;
     render();
@@ -652,6 +862,7 @@ onAuthStateChanged(auth, async (user) => {
       listenSharedData();
     } else if (state.profile) {
       state.device = { status: "active" };
+      maybeShowShareReturnConfirmation();
       listenProfile(user.uid);
       listenSharedData();
     }
@@ -800,7 +1011,7 @@ function statCard(icon, label, value, note, tint) {
 
 function courseCard(course, index) {
   const color = ["course-cyan", "course-purple", "course-blue"][index % 3];
-  return `<button class="course-card ${color}" data-course="${h(course.id)}"><div class="course-card-top"><span class="course-icon">▤</span><span class="course-arrow">←</span></div><div class="course-card-copy"><span>${h(course.grade)} · ${h(course.track)}</span><h3>${h(course.title)}</h3><p>${h(course.description || "محتوى تعليمي منظم حسب الفصول والدروس.")}</p></div><div class="course-card-bottom"><span>ابدأ التعلّم</span><span class="course-dots">•••</span></div></button>`;
+  return `<button class="course-card ${color}" data-course="${h(course.id)}"><div class="course-card-top"><span class="course-icon">▤</span><span class="course-arrow">←</span></div><div class="course-card-copy"><span>${h(courseFilterLabel(course.grade))} · ${h(courseFilterLabel(course.track))}</span><h3>${h(course.title)}</h3><p>${h(course.description || "محتوى تعليمي منظم حسب الفصول والدروس.")}</p></div><div class="course-card-bottom"><span>ابدأ التعلّم</span><span class="course-dots">•••</span></div></button>`;
 }
 
 function emptyState(icon, title, body, action = "") {
@@ -815,12 +1026,14 @@ function progressBlock() {
 function dashboardView() {
   const firstName = displayName().split(" ")[0];
   const preview = state.courses.slice(0, 2);
+  const courseCountValue = state.admin ? (state.courses.length || 0) : learnCatalogCount();
+  const studentCrowdValue = studentCommunityCount();
   return `<div class="dashboard-page"><div class="welcome-banner"><div class="welcome-content"><span class="eyebrow"><span class="online-dot"></span> منصتك التعليمية في مكان واحد</span>
     <h1>${state.admin ? "أهلاً بك في لوحة الإشراف" : `أهلاً يا ${h(firstName)}،<br>جاهز لخطوتك الجاية؟`}</h1>
     <p>${state.admin ? "أدر المحتوى وتابع الطلاب من مكان واحد." : "اختار درس النهاردة وخلي هدفك أقرب."}</p>
     ${state.admin ? "" : `<button class="button button-light" data-nav="learning">ابدأ التعلّم ←</button>`}</div>
     <div class="welcome-art" aria-hidden="true"><div class="art-ring ring-a"></div><div class="art-ring ring-b"></div><div class="art-book">▤</div><div class="art-star star-a">✦</div><div class="art-star star-b">✧</div><div class="art-dot"></div></div><div class="banner-grain"></div></div>
-    <div class="stat-grid">${statCard("▤", "المنصات المتاحة", String(state.courses.length).padStart(2, "0"), state.admin ? "في مكتبة المحتوى" : "جاهزة لتبدأ", "cyan")}${statCard("▧", "إعلانات جديدة", String(state.announcements.length).padStart(2, "0"), "من فريق الإشراف", "purple")}${statCard("⌂", state.admin ? "أجهزة المشرف النشطة" : "الصف الدراسي", state.admin ? String(state.adminDeviceCount) : state.profile.grade.replace(" الثانوي", ""), state.admin ? "بلا حد أقصى" : state.profile.track, "blue")}</div>
+    <div class="stat-grid">${statCard("▤", "المنصات المتاحة", String(courseCountValue).padStart(2, "0"), state.admin ? "في مكتبة المحتوى" : "متاحة للطلاب", "cyan")}${statCard("▧", "إعلانات جديدة", String(state.announcements.length).padStart(2, "0"), "من فريق الإشراف", "purple")}${statCard("◌", state.admin ? "أجهزة المشرف النشطة" : "طلابنا", state.admin ? String(state.adminDeviceCount) : String(studentCrowdValue), state.admin ? "بلا حد أقصى" : "أكثر من 3× العدد الحقيقي", "blue")}</div>
     ${state.admin ? "" : `${state.warnings.length ? `<section class="panel warning-panel"><div class="panel-heading"><div><span class="eyebrow">تنبيه من الإشراف</span><h2>ملاحظات على حسابك</h2></div></div>${state.warnings.map((warning) => `<article class="warning-row"><b>${h(warning.body)}</b><small>${h(timestampText(warning.createdAt, true))}</small></article>`).join("")}</section>` : ""}
     <div class="dashboard-columns"><section class="panel learning-panel"><div class="panel-heading"><div><span class="eyebrow">مساحة التعلّم</span><h2>منصاتك الدراسية</h2></div><button class="text-button" data-nav="learning">عرض الكل ←</button></div>
     ${preview.length ? `<div class="course-mini-grid">${preview.map(courseCard).join("")}</div>` : emptyState("▤", "لسه مفيش منصات", "سيظهر محتوى صفك هنا بمجرد إضافته من المشرف.")}</section>
@@ -877,8 +1090,8 @@ function learningView() {
   if (state.selectedCourse) {
     const groups = chapterGroups();
     return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-courses">كل المنصات</button> ← <b>${h(state.selectedCourse.title)}</b></div>
-      <div class="page-title-row course-title-row"><div><span class="eyebrow">${h(state.selectedCourse.grade)} · ${h(state.selectedCourse.track)}</span><h1>${h(state.selectedCourse.title)}</h1><p>${h(state.selectedCourse.description || "اختار الفصل أو المحتوى اللي حابب تراجعه.")}</p></div>${state.admin ? `<div class="course-title-actions"><button class="button button-outline" data-action="edit-course">تعديل المنصة</button><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>` : ""}</div>
-      ${groups.length ? `<div class="chapter-list">${groups.map((chapter, chapterIndex) => `<section class="chapter-card"><div class="chapter-title"><span class="chapter-index">${chapter.type === "exam" ? "E" : String(chapter.number || chapterIndex + 1).padStart(2, "0")}</span><div><span class="eyebrow">${chapter.type === "exam" ? "امتحانات" : `الفصل ${chapter.number || chapterIndex + 1}`}</span><h2>${h(chapter.title)}</h2></div><span class="chapter-count">${chapter.lessons.length} محتوى</span>${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-edit" data-action="edit-chapter" data-chapter="${h(chapter.id)}">تعديل الفصل</button>` : ""}</div><div class="chapter-lessons">${chapter.lessons.map((lesson, index) => `<button class="lesson-row" data-lesson="${h(lesson.id)}"><span class="lesson-index ${lesson.type === "exam" ? "exam-index" : ""}">${lesson.type === "exam" ? "▣" : String(index + 1).padStart(2, "0")}</span><span class="lesson-row-copy"><b>${h(lesson.title)}</b><small>${lesson.type === "exam" ? "امتحان ومراجعة" : `${lesson.entries?.length || 0} سؤال وإجابة`}</small></span><span>←</span></button>`).join("")}${chapter.lessons.length ? "" : `<p class="chapter-empty">لا توجد دروس في هذا الفصل بعد.</p>`}${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-add-lesson" data-action="add-lesson" data-chapter="${h(chapter.id)}">＋ إضافة درس أو امتحان لهذا الفصل</button>` : ""}</div></section>`).join("")}</div>` : emptyState("▤", "لم تُضف فصولاً بعد", "أنشئ فصول المنصة ثم أضف الدروس والامتحانات داخل كل فصل.", state.admin ? `<button class="button button-primary" data-action="add-chapter">＋ إضافة أول فصل</button>` : "")}</div>`;
+      <div class="page-title-row course-title-row"><div><span class="eyebrow">${h(courseFilterLabel(state.selectedCourse.grade))} · ${h(courseFilterLabel(state.selectedCourse.track))}</span><h1>${h(state.selectedCourse.title)}</h1><p>${h(state.selectedCourse.description || "اختار الفصل أو المحتوى اللي حابب تراجعه.")}</p></div>${state.admin ? `<div class="course-title-actions"><button class="button button-outline" data-action="edit-course">تعديل المنصة</button><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>` : ""}</div>
+      ${groups.length ? `<div class="chapter-list">${groups.map((chapter, chapterIndex) => `<section class="chapter-card"><div class="chapter-title"><span class="chapter-index">${chapter.type === "exam" ? "E" : String(chapter.number || chapterIndex + 1).padStart(2, "0")}</span><div><span class="eyebrow">${chapter.type === "exam" ? "امتحانات" : `الفصل ${chapter.number || chapterIndex + 1}`}</span><h2>${h(chapter.title)}</h2></div><span class="chapter-count">${chapter.lessons.length} محتوى</span>${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-edit" data-action="edit-chapter" data-chapter="${h(chapter.id)}">تعديل الفصل</button>` : ""}</div><div class="chapter-lessons">${chapter.lessons.map((lesson, index) => `<div class="lesson-row-wrap"><button class="lesson-row" data-lesson="${h(lesson.id)}"><span class="lesson-index ${lesson.type === "exam" ? "exam-index" : ""}">${lesson.type === "exam" ? "▣" : String(index + 1).padStart(2, "0")}</span><span class="lesson-row-copy"><b>${h(lesson.title)}</b><small>${lesson.type === "exam" ? "امتحان ومراجعة" : `${lesson.entries?.length || 0} سؤال وإجابة`}</small></span><span>←</span></button>${state.admin ? `<div class="lesson-tools"><button class="text-button" data-action="move-lesson-up" data-lesson="${h(lesson.id)}">↑</button><button class="text-button" data-action="move-lesson-down" data-lesson="${h(lesson.id)}">↓</button><button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل</button><button class="text-button danger" data-action="delete-lesson" data-lesson="${h(lesson.id)}">حذف</button></div>` : ""}</div>`).join("")}${chapter.lessons.length ? "" : `<p class="chapter-empty">لا توجد دروس في هذا الفصل بعد.</p>`}${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-add-lesson" data-action="add-lesson" data-chapter="${h(chapter.id)}">＋ إضافة درس أو امتحان لهذا الفصل</button>` : ""}</div></section>`).join("")}</div>` : emptyState("▤", "لم تُضف فصولاً بعد", "أنشئ فصول المنصة ثم أضف الدروس والامتحانات داخل كل فصل.", state.admin ? `<button class="button button-primary" data-action="add-chapter">＋ إضافة أول فصل</button>` : "")}</div>`;
   }
   return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>اختار منصتك وابدأ</h1><p>محتوى مرتب حسب الصف والمسار الدراسي.</p></div>${state.admin ? `<button class="button button-primary" data-action="add-course">＋ إضافة منصة</button>` : ""}</div>
     ${state.admin ? "" : `<div class="filter-chips"><span class="filter-chip">⌂ ${h(state.profile.grade)}</span><span class="filter-chip">${h(state.profile.track)}</span></div>`}
@@ -902,7 +1115,7 @@ function lessonView() {
   }
   const entries = lesson.type === "exam" ? state.examEntries : (lesson.entries || []);
   const position = state.lessons.findIndex((item) => item.id === lesson.id);
-  return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-lessons">${h(state.selectedCourse?.title || "")}</button> ← <b>${h(lesson.title)}</b></div>
+  return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-lessons">${h(state.selectedCourse?.title || "")}</button> ← <b>${h(lesson.title)}</b>${state.admin ? `<button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل الدرس</button>` : ""}</div>
     <div class="lesson-heading"><div class="lesson-symbol">▤</div><div><span class="eyebrow">${lesson.type === "exam" ? "مراجعة واختبار" : h(chapter?.title || lesson.chapterTitle || `الفصل ${lesson.chapterNumber}`)}</span><h1>${h(lesson.title)}</h1></div><span class="pill">${entries.length} سؤال</span></div>
     ${lesson.type === "exam" ? `<div class="exam-note">✦ قد تظهر الأسئلة بترتيب مختلف في الامتحان. راجع كل إجابة جيداً.</div>` : ""}
     <div class="qa-list">${entries.map((entry, index) => `<article class="qa-card"><div class="qa-number">س${String(index + 1).padStart(2, "0")}</div><div class="qa-body"><h3>${h(entry.question)}</h3><div class="answer-box"><span>الإجابة</span><p>${h(entry.answer)}</p></div></div><button class="copy-button" data-copy="${h(entry.answer)}"><span>▣</span><span>نسخ</span></button></article>`).join("")}</div>
@@ -910,15 +1123,46 @@ function lessonView() {
 }
 
 function chatView(support) {
-  const title = support ? (state.admin ? "محادثة خاصة مع الطالب" : "تواصل مع المشرف") : "شات الطلاب";
+  if (support && state.admin && !state.supportTarget) return supportInboxView();
+  const title = support ? (state.admin
+    ? state.students.find((student) => student.id === state.supportTarget)?.fullName || "محادثة الطالب"
+    : "تواصل مع المشرف") : "شات الطلاب";
+  const ended = support && !state.admin && supportReplyExpired(state.supportRoom);
+  const canSend = !support || (state.admin
+    ? Boolean(state.supportRoom)
+    : state.supportRoom ? (!ended || state.supportDraftOpen) : state.supportDraftOpen);
+  const supportNotice = !support ? "" : !state.supportRoom && !state.admin
+    ? `<div class="support-ended"><b>تواصل مع المشرف</b><span>ابدأ دردشة خاصة، وسيصلك الرد هنا مع الاحتفاظ بسجل المحادثة.</span><button class="button button-primary" data-action="start-support-chat">بدء دردشة جديدة</button></div>`
+    : !state.supportRoom ? "" : state.admin
+    ? `<div class="support-status">${state.supportRoom.awaitingAdminReply ? "الطالب بانتظار ردك." : supportReplyExpired(state.supportRoom) ? "انتهت مهلة الرد؛ سجل المحادثة محفوظ." : "تم إرسال ردك، وبانتظار رد الطالب."}</div>`
+    : ended
+      ? `<div class="support-ended" role="status"><b>تم إنهاء الدردشات</b><span>مرّت 24 ساعة دون رد. سجل المحادثة السابقة محفوظ ويمكنك بدء دردشة جديدة في أي وقت.</span>${state.supportDraftOpen ? `<small>اكتب رسالتك الجديدة لإعادة فتح التواصل.</small>` : `<button class="button button-primary" data-action="start-support-chat">بدء دردشة جديدة</button>`}</div>`
+      : state.supportRoom.awaitingAdminReply
+        ? `<div class="support-status">تم استلام رسالتك، وسيتم الرد عليك خلال 24 ساعة.</div>`
+        : `<div class="support-status">رد المشرف بانتظارك. يمكنك الرد خلال 24 ساعة للمتابعة.</div>`;
+  const backButton = support && state.admin
+    ? `<button class="button button-outline" data-action="back-support-inbox">← صندوق الوارد</button>` : "";
   const description = support
-    ? (state.admin ? "هذه المحادثة خاصة بينك وبين الطالب." : "رسالتك خاصة ولا يراها إلا فريق الإشراف. سيصلك رد خلال 24 ساعة.")
-    : "تواصل مع زملائك في مساحة واحدة. تُحذف الرسائل بعد 24 ساعة.";
-  const targetSelector = support && state.admin ? `<div class="support-select"><label for="support-student">اختر الطالب للتواصل</label><select id="support-student" data-change="support-target"><option value="">اختر حساباً</option>${state.students.map((student) => `<option value="${h(student.id)}" ${state.supportTarget === student.id ? "selected" : ""}>${h(student.fullName)} · ${h(student.studentCode)}</option>`).join("")}</select></div>` : "";
-  return `<section class="chat-page">${targetSelector}<div class="page-title-row"><div><span class="eyebrow">مساحة التواصل</span><h1>${title}</h1><p>${description}</p></div><span class="privacy-badge">♢ ${support ? "محادثة خاصة" : "رسائل مؤقتة"}</span></div>
-    <div class="chat-card"><div class="chat-head"><div class="chat-head-icon">◌</div><div><b>${title}</b><small>${support ? "بين المشرف والطالب فقط" : "تُحذف الرسائل تلقائياً بعد 24 ساعة"}</small></div><span class="online-dot"></span></div>
-    <div class="chat-stream">${state.chatMessages.length ? state.chatMessages.map((message) => `<div class="chat-message ${message.kind === "system" ? "system-message" : message.senderId === state.user.uid ? "mine" : ""}"><div class="message-meta"><b>${h(message.senderName)}</b><small>${h(timestampText(message.createdAt, true))}</small></div><p>${h(message.text)}</p>${state.admin && message.kind !== "system" ? `<button class="message-delete" data-delete-message="${h(message.id)}">×</button>` : ""}</div>`).join("") : emptyState("◌", "ابدأ المحادثة", state.admin && support && !state.supportTarget ? "اختر حساب طالب أولاً." : "اكتب أول رسالة وابدأ التواصل.")}</div>
-    <form class="chat-composer" data-form="chat"><input name="text" value="${h(state.chatText)}" placeholder="اكتب رسالتك هنا..." maxlength="2000" ${state.admin && support && !state.supportTarget ? "disabled" : ""}><button class="send-button" ${state.busy ? "disabled" : ""}>➤</button></form></div></section>`;
+    ? (state.admin ? "محادثة خاصة دائمة بينك وبين الطالب." : "محادثتك خاصة ومحفوظة كسجل دائم بينك وبين المشرف.")
+    : "تواصل مع زملائك في مساحة واحدة. تُحذف رسائل الشات العام بعد 24 ساعة.";
+  return `<section class="chat-page"><div class="page-title-row"><div><span class="eyebrow">مساحة التواصل</span><h1>${h(title)}</h1><p>${description}</p></div><div class="chat-page-actions">${backButton}<span class="privacy-badge">♢ ${support ? "سجل خاص محفوظ" : "رسائل مؤقتة"}</span></div></div>
+    <div class="chat-card"><div class="chat-head"><div class="chat-head-icon">◌</div><div><b>${h(title)}</b><small>${support ? "سجل المحادثة محفوظ للطرفين" : "تُحذف رسائل الشات العام بعد 24 ساعة"}</small></div><span class="online-dot"></span></div>
+    ${supportNotice}
+    <div class="chat-stream">${state.chatMessages.length ? state.chatMessages.map((message) => `<div class="chat-message ${message.kind === "system" ? "system-message" : message.senderId === state.user.uid ? "mine" : ""}"><div class="message-meta"><b>${h(message.senderName)}</b><small>${h(timestampText(message.createdAt, true))}</small></div><p>${h(message.text)}</p>${state.admin && !support && message.kind !== "system" ? `<button class="message-delete" data-delete-message="${h(message.id)}">×</button>` : ""}</div>`).join("") : emptyState("◌", "ابدأ المحادثة", "اكتب أول رسالة وابدأ التواصل.")}</div>
+    <form class="chat-composer" data-form="chat"><input name="text" value="${h(state.chatText)}" placeholder="${ended && state.supportDraftOpen ? "اكتب رسالتك لبدء دردشة جديدة..." : "اكتب رسالتك هنا..."}" maxlength="2000" ${!canSend ? "disabled" : ""}><button class="send-button" ${state.busy || !canSend ? "disabled" : ""} aria-label="إرسال الرسالة">➤</button></form></div></section>`;
+}
+
+function supportInboxView() {
+  const studentsById = new Map(state.students.map((student) => [student.id, student]));
+  const rooms = state.supportRooms.map((room) => ({
+    ...room,
+    student: studentsById.get(room.studentUid),
+    preview: room.latestMessage
+      ? { text: room.latestMessage, senderId: room.latestSenderId, createdAt: room.latestMessageAt }
+      : state.supportPreviews[room.id],
+  }));
+  return `<section class="chat-page support-inbox-page"><div class="page-title-row"><div><span class="eyebrow">صندوق الوارد</span><h1>محادثات الطلاب</h1><p>اختر محادثة للانتقال مباشرة إلى سجل الطالب والرد عليه.</p></div><span class="privacy-badge">♢ ${rooms.length} محادثة</span></div>
+    <div class="support-inbox">${rooms.length ? rooms.map((room) => `<button class="support-inbox-row" data-support-target="${h(room.studentUid)}"><span class="support-avatar">${h((room.student?.fullName || room.studentUid).slice(0, 1))}</span><span class="support-inbox-copy"><span class="support-inbox-title"><b>${h(room.student?.fullName || "طالب")}</b><small>${h(room.student?.studentCode || "")}</small></span><span class="support-inbox-preview">${room.preview ? `${room.preview.senderId === state.user.uid ? "أنت: " : ""}${h(room.preview.text || "")}` : "افتح المحادثة لعرض الرسائل السابقة"}</span></span><span class="support-inbox-meta"><small>${h(timestampText(room.preview?.createdAt || room.updatedAt, true))}</small><b class="${room.awaitingAdminReply ? "inbox-waiting" : "inbox-replied"}">${room.awaitingAdminReply ? "بانتظار ردك" : "تم الرد"}</b></span><span class="support-inbox-arrow">←</span></button>`).join("") : emptyState("◌", "لا توجد محادثات بعد", "ستظهر هنا رسائل الطلاب الجديدة تلقائياً.")}</div></section>`;
 }
 
 function announcementsView() {
@@ -934,6 +1178,16 @@ function adminView() {
     <div class="admin-metrics">${statCard("♧", "حسابات مسجلة", String(state.students.length).padStart(2, "0"), "طلاب على المنصة", "cyan")}${statCard("G", "تسجيل الطلاب", "Google", "حساب مرتبط بالطالب", "purple")}${statCard("▤", "منصات تعليمية", String(state.courses.length).padStart(2, "0"), "في مكتبة المحتوى", "blue")}</div>
     <section class="panel students-panel"><div class="panel-heading"><div><span class="eyebrow">قاعدة الحسابات</span><h2>حسابات الطلاب</h2></div><div class="search-field"><span>⌕</span><input data-change="search" value="${h(state.search)}" placeholder="ابحث بالاسم أو الكود"></div></div>
     <div class="student-table-wrap"><table class="student-table"><thead><tr><th>الطالب والبريد</th><th>كود الدعوة</th><th>الهاتف</th><th>الصف / المسار</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>${students.map((student) => `<tr><td><div class="student-name"><span class="avatar tiny">${h(student.fullName?.slice(0, 1))}</span><span class="student-identity"><b>${h(student.fullName)}</b><small>${h(student.email)}</small></span></div></td><td><span class="code">${h(student.studentCode || "—")}</span></td><td dir="ltr">${h(student.phone)}</td><td>${h(student.grade)} · ${h(student.track)}</td><td><span class="status-pill ${student.isActive ? "status-active" : "status-banned"}">${student.isActive ? "نشط" : "محظور"}</span></td><td><div class="table-actions"><button title="تحذير" data-warning="${h(student.id)}">▧</button>${student.isActive ? `<button class="danger-icon" title="حظر" data-ban="${h(student.id)}">♢</button>` : ""}</div></td></tr>`).join("")}</tbody></table>${students.length ? "" : emptyState("♧", "لا توجد حسابات", "ستظهر الحسابات المسجلة هنا.")}</div></section></div>`;
+}
+
+function maybeShowShareReturnConfirmation() {
+  const params = new URLSearchParams(location.search);
+  if (params.get("wa") !== "1" || !state.user || !state.profile?.isActive) return;
+  state.modal = "whatsapp-share-added";
+  state.notice = "تم إرسال الدعوة عبر واتساب بنجاح. وبمجرد الرجوع للمنصة سيتم تأكيدها تلقائياً.";
+  state.whatsappShareDraft = {
+    url: `https://wa.me/?text=${encodeURIComponent(`انضم إلى AF MASTER وابدأ التعلم معي! ${location.origin}${location.pathname}?ref=${state.profile?.studentCode || ""}`)}`,
+  };
 }
 
 function modalView() {
@@ -973,7 +1227,9 @@ function modalView() {
   if (state.modal === "course") {
     const course = state.courses.find((item) => item.id === state.editingCourseId) || state.selectedCourse;
     const editing = Boolean(state.editingCourseId && course);
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل المنصة" : "إضافة منصة جديدة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><form class="form-grid" data-form="course"><label>اسم المنصة<input name="title" required value="${editing ? h(course.title) : ""}" placeholder="مثال: منصة الرياضيات"></label><label>وصف مختصر<input name="description" value="${editing ? h(course.description || "") : ""}" placeholder="محتوى المنصة"></label>${editing ? `<div class="filter-chips"><span class="filter-chip">${h(course.grade)}</span><span class="filter-chip">${h(course.track)}</span></div><small class="muted">الصف والمسار ثابتان بعد إضافة المنصة للحفاظ على ربط الدروس.</small>` : `<div class="form-row"><label>الصف<select name="grade">${gradeOptions()}</select></label><label>المسار<select name="track">${trackOptions()}</select></label></div>`}<button class="button button-primary">${editing ? "حفظ التعديلات" : "＋ إضافة المنصة"}</button></form></section></div>`;
+    const selectedGrades = normalizeCourseFilterValues(editing ? course.grade : grades);
+    const selectedTracks = normalizeCourseFilterValues(editing ? course.track : [tracks[0]]);
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل المنصة" : "إضافة منصة جديدة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><form class="form-grid" data-form="course"><label>اسم المنصة<input name="title" required value="${editing ? h(course.title) : ""}" placeholder="مثال: منصة الرياضيات"></label><label>وصف مختصر<input name="description" value="${editing ? h(course.description || "") : ""}" placeholder="محتوى المنصة"></label><div class="multi-check-list"><label>الصفوف المتاحة</label><div class="check-grid">${grades.map((grade) => `<label class="check-item"><input type="checkbox" name="grade" value="${h(grade)}" ${selectedGrades.includes(grade) ? "checked" : ""}> <span>${h(grade)}</span></label>`).join("")}</div></div><div class="multi-check-list"><label>المسارات المتاحة</label><div class="check-grid">${courseTrackOptions.map((track) => `<label class="check-item"><input type="checkbox" name="track" value="${h(track)}" ${selectedTracks.includes(track) ? "checked" : ""}> <span>${h(track)}</span></label>`).join("")}</div></div><button class="button button-primary">${editing ? "حفظ التعديلات" : "＋ إضافة المنصة"}</button></form></section></div>`;
   }
   if (state.modal === "chapter") {
     const chapter = state.chapters.find((item) => item.id === state.editingChapterId);
@@ -982,22 +1238,40 @@ function modalView() {
     return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل الفصل" : "إضافة فصل للمنصة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${h(state.selectedCourse?.title || "")}</p><form class="form-grid" data-form="chapter"><div class="form-row"><label>الترتيب<input name="number" type="number" min="1" value="${editing ? h(chapter.number) : nextNumber}" required></label><label>نوع الفصل<select name="type"><option value="chapter" ${editing && chapter.type === "exam" ? "" : "selected"}>فصل دراسي</option><option value="exam" ${editing && chapter.type === "exam" ? "selected" : ""}>قسم الامتحانات</option></select></label></div><label>اسم الفصل / القسم<input name="title" required maxlength="100" value="${editing ? h(chapter.title) : ""}" placeholder="${editing && chapter.type === "exam" ? "الامتحانات" : "مثال: Chapter 1 — الحركة"}"></label><button class="button button-primary">${editing ? "حفظ الفصل" : "＋ إضافة الفصل"}</button></form></section></div>`;
   }
   if (state.modal === "lesson") {
+    const lesson = state.lessons.find((item) => item.id === state.editingLessonId) || null;
     const selectedChapter = state.chapters.find((item) => item.id === state.selectedChapterId) || state.chapters[0];
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>إضافة درس أو امتحان</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${h(state.selectedCourse?.title || "")}</p>${state.chapters.length ? `<form class="form-grid lesson-form" data-form="lesson">
-      <label>الفصل<select name="chapterId" required>${state.chapters.map((chapter) => `<option value="${h(chapter.id)}" ${selectedChapter?.id === chapter.id ? "selected" : ""}>${h(chapter.title)}</option>`).join("")}</select></label>
-      <label>اسم الدرس / الامتحان<input name="title" required placeholder="مثال: الدرس الأول"></label><label>نوع المحتوى<select name="type"><option value="lesson">درس</option><option value="exam">امتحان</option></select></label>
-      <div class="question-fields">${Array.from({ length: 3 }, (_, index) => questionFields(index)).join("")}</div>
-      <button type="button" class="text-button" data-action="add-question">＋ إضافة سؤال</button><button class="button button-primary">حفظ المحتوى</button></form>` : `<div class="empty-state"><p>أنشئ فصلاً أولاً، ثم أضف الدروس والامتحانات بداخله.</p><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>`}</section></div>`;
+    const chapterId = lesson?.chapterId || selectedChapter?.id || "";
+    const titleValue = lesson?.title || "";
+    const typeValue = lesson?.type || "lesson";
+    const entries = lesson?.entries || [];
+    const inputCount = Math.max(3, entries.length || 3);
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${lesson ? "تعديل درس أو امتحان" : "إضافة درس أو امتحان"}</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${h(state.selectedCourse?.title || "")}</p>${state.chapters.length ? `<form class="form-grid lesson-form" data-form="lesson">
+      <label>الفصل<select name="chapterId" required>${state.chapters.map((chapter) => `<option value="${h(chapter.id)}" ${chapterId === chapter.id ? "selected" : ""}>${h(chapter.title)}</option>`).join("")}</select></label>
+      <label>اسم الدرس / الامتحان<input name="title" required placeholder="مثال: الدرس الأول" value="${h(titleValue)}"></label><label>نوع المحتوى<select name="type"><option value="lesson" ${typeValue === "lesson" ? "selected" : ""}>درس</option><option value="exam" ${typeValue === "exam" ? "selected" : ""}>امتحان</option></select></label>
+      <div class="question-fields">${Array.from({ length: inputCount }, (_, index) => questionFields(index, entries[index]?.question || "", entries[index]?.answer || "")).join("")}</div>
+      <button type="button" class="text-button" data-action="add-question">＋ إضافة سؤال</button><button class="button button-primary">${lesson ? "حفظ التعديلات" : "حفظ المحتوى"}</button></form>` : `<div class="empty-state"><p>أنشئ فصلاً أولاً، ثم أضف الدروس والامتحانات بداخله.</p><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>`}</section></div>`;
   }
   return "";
 }
 
-function questionFields(index) {
-  return `<div class="question-entry"><b>سؤال ${index + 1}</b><label>السؤال<textarea name="question-${index}" rows="2" ${index === 0 ? "required" : ""} placeholder="اكتب السؤال..."></textarea></label><label>الإجابة<textarea name="answer-${index}" rows="2" ${index === 0 ? "required" : ""} placeholder="اكتب الإجابة..."></textarea></label></div>`;
+function questionFields(index, question = "", answer = "") {
+  return `<div class="question-entry"><b>سؤال ${index + 1}</b><label>السؤال<textarea name="question-${index}" rows="2" ${index === 0 ? "required" : ""} placeholder="اكتب السؤال...">${h(question)}</textarea></label><label>الإجابة<textarea name="answer-${index}" rows="2" ${index === 0 ? "required" : ""} placeholder="اكتب الإجابة...">${h(answer)}</textarea></label></div>`;
 }
 
 function currentFormData(form) {
-  return Object.fromEntries(new FormData(form).entries());
+  const result = {};
+  for (const [key, value] of new FormData(form).entries()) {
+    if (Object.prototype.hasOwnProperty.call(result, key)) {
+      const existing = result[key];
+      result[key] = Array.isArray(existing) ? [...existing, value] : [existing, value];
+      continue;
+    }
+    result[key] = value;
+  }
+  Object.keys(result).forEach((key) => {
+    if (Array.isArray(result[key]) && result[key].length === 1) result[key] = result[key][0];
+  });
+  return result;
 }
 
 async function handleSubmit(event) {
@@ -1129,7 +1403,8 @@ async function handleSubmit(event) {
         if (existingShare.exists()) throw new Error("تمت إضافة هذا الرقم من قبل. أدخل رقماً مختلفاً.");
         const currentCount = Number(profileSnapshot.data().whatsappShareCount || 0);
         if (currentCount >= 10) throw new Error("اكتمل العدد المطلوب بالفعل.");
-        const text = `انضم إلى AF MASTER وابدأ التعلم معي! ${location.origin}${location.pathname}?ref=${state.profile?.studentCode || ""}`;
+        const text = `انضم إلى AF MASTER وابدأ التعلم معي! ${location.origin}${location.pathname}?ref=${state.profile?.studentCode || ""}&wa=1`;
+        const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(text)}`;
         const batch = writeBatch(db);
         batch.update(profileRef, {
           whatsappShareCount: increment(1),
@@ -1146,12 +1421,14 @@ async function handleSubmit(event) {
           whatsappShareCount: nextCount,
           lastWhatsAppShareId: recipientHash,
         };
-        state.whatsappShareDraft = {
-          url: `https://wa.me/${phone}?text=${encodeURIComponent(text)}`,
-        };
+        state.whatsappShareDraft = { url: waUrl };
         state.modal = "whatsapp-share-added";
         state.error = "";
         listenSharedData();
+        const shareWindow = window.open(waUrl, "_blank", "noopener,noreferrer");
+        if (!shareWindow) {
+          state.notice = "تم حفظ الرقم بنجاح. تستطيع إرسال الدعوة يدوياً عبر الزر في الشاشة التالية.";
+        }
         notify(nextCount >= 10
           ? "اكتمل العدد! منصات التعلّم أصبحت متاحة."
           : `تمت إضافة الرقم. باقي ${10 - nextCount} أرقام مختلفة.`);
@@ -1165,22 +1442,31 @@ async function handleSubmit(event) {
         const title = String(data.title || "").trim();
         const description = String(data.description || "").trim();
         if (!title) throw new Error("اكتب اسم المنصة.");
+        const selectedGrades = normalizeCourseFilterValues(data.grade);
+        const selectedTracks = normalizeCourseFilterValues(data.track);
+        if (!selectedGrades.length || !selectedTracks.length) {
+          throw new Error("اختر صفاً واحداً على الأقل ومساراً واحداً على الأقل.");
+        }
+        const gradeValue = selectedGrades.length > 1 ? selectedGrades : selectedGrades[0];
+        const trackValue = selectedTracks.length > 1 ? selectedTracks : selectedTracks[0];
         let notice;
         if (state.editingCourseId) {
-          await updateDoc(doc(db, "courses", state.editingCourseId), { title, description });
+          await updateDoc(doc(db, "courses", state.editingCourseId), {
+            title,
+            description,
+            grade: gradeValue,
+            track: trackValue,
+          });
           if (state.selectedCourse?.id === state.editingCourseId) {
-            state.selectedCourse = { ...state.selectedCourse, title, description };
+            state.selectedCourse = { ...state.selectedCourse, title, description, grade: gradeValue, track: trackValue };
           }
           notice = "تم تحديث المنصة.";
         } else {
-          if (!grades.includes(String(data.grade)) || !tracks.includes(String(data.track))) {
-            throw new Error("اختر الصف والمسار الدراسيين.");
-          }
           await addDoc(collection(db, "courses"), {
             title,
             description,
-            grade: data.grade,
-            track: data.track,
+            grade: gradeValue,
+            track: trackValue,
             createdAt: serverTimestamp(),
           });
           notice = "تمت إضافة المنصة بنجاح.";
@@ -1237,7 +1523,7 @@ async function handleSubmit(event) {
         if (!["lesson", "exam"].includes(String(data.type))) throw new Error("اختر نوع محتوى صحيحاً.");
         const chapter = state.chapters.find((item) => item.id === data.chapterId);
         if (!chapter) throw new Error("اختر فصلاً صحيحاً.");
-        await addDoc(collection(db, "lessons"), {
+        const payload = {
           courseId: state.selectedCourse.id,
           chapterId: chapter.id,
           grade: state.selectedCourse.grade,
@@ -1247,10 +1533,21 @@ async function handleSubmit(event) {
           title,
           type: data.type,
           entries,
-          createdAt: serverTimestamp(),
-        });
+          sortOrder: Number(data.sortOrder || Date.now()),
+        };
+        if (state.editingLessonId) {
+          await updateDoc(doc(db, "lessons", state.editingLessonId), payload);
+          notify("تم تحديث المحتوى بنجاح.");
+        } else {
+          await addDoc(collection(db, "lessons"), {
+            ...payload,
+            createdAt: serverTimestamp(),
+            sortOrder: Number(Date.now()),
+          });
+          notify("تمت إضافة المحتوى بنجاح.");
+        }
+        state.editingLessonId = null;
         state.modal = "";
-        notify("تمت إضافة المحتوى بنجاح.");
         break;
       }
       case "school-info":
@@ -1277,6 +1574,7 @@ async function handleSubmit(event) {
           createdAt: serverTimestamp(),
           expiresAt: Timestamp.fromDate(new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)),
           createdBy: state.user.uid,
+          hidden: false,
         });
         notify("تم إرسال الإعلان للطلاب. سيُحذف تلقائياً بعد 3 أيام.");
         break;
@@ -1389,6 +1687,20 @@ async function clickAction(action, target, originalTarget) {
         render();
       }
       break;
+    case "start-support-chat":
+      if (state.admin || state.nav !== "support" || !state.profile?.isActive) break;
+      state.supportDraftOpen = true;
+      render();
+      root.querySelector('.chat-composer input[name="text"]')?.focus();
+      break;
+    case "back-support-inbox":
+      if (!state.admin) break;
+      state.supportTarget = "";
+      state.chatText = "";
+      state.chatMessages = [];
+      listenChat();
+      render();
+      break;
     case "logout": await logout(); break;
     case "dismiss": state.error = ""; state.notice = ""; render(); break;
     case "profile": state.modal = "profile"; render(); break;
@@ -1404,11 +1716,51 @@ async function clickAction(action, target, originalTarget) {
       state.modal = "chapter";
       render();
       break;
+    case "edit-lesson":
+      if (!state.admin || !target.dataset.lesson) break;
+      state.editingLessonId = target.dataset.lesson;
+      state.selectedChapterId = state.lessons.find((lesson) => lesson.id === target.dataset.lesson)?.chapterId || state.selectedChapterId;
+      state.modal = "lesson";
+      render();
+      break;
+    case "delete-lesson":
+      if (!state.admin || !target.dataset.lesson) break;
+      if (!window.confirm("هل تريد حذف هذا الدرس؟")) break;
+      try {
+        await deleteDoc(doc(db, "lessons", target.dataset.lesson));
+        notify("تم حذف الدرس.");
+      } catch (error) { fail(error); }
+      break;
+    case "move-lesson-up":
+    case "move-lesson-down": {
+      if (!state.admin || !target.dataset.lesson) break;
+      const lessonId = target.dataset.lesson;
+      const sortedLessons = [...state.lessons].sort((a, b) => {
+        const rankA = Number(a.sortOrder ?? a.createdAt?.toMillis?.() ?? 0);
+        const rankB = Number(b.sortOrder ?? b.createdAt?.toMillis?.() ?? 0);
+        return rankA - rankB;
+      });
+      const index = sortedLessons.findIndex((lesson) => lesson.id === lessonId);
+      if (index < 0) break;
+      const targetIndex = action === "move-lesson-up" ? index - 1 : index + 1;
+      if (targetIndex < 0 || targetIndex >= sortedLessons.length) break;
+      const current = sortedLessons[index];
+      const swap = sortedLessons[targetIndex];
+      const currentOrder = Number(current.sortOrder ?? current.createdAt?.toMillis?.() ?? 0);
+      const swapOrder = Number(swap.sortOrder ?? swap.createdAt?.toMillis?.() ?? 0);
+      await Promise.all([
+        updateDoc(doc(db, "lessons", current.id), { sortOrder: swapOrder }),
+        updateDoc(doc(db, "lessons", swap.id), { sortOrder: currentOrder }),
+      ]);
+      notify("تم تحديث ترتيب الدروس.");
+      break;
+    }
     case "close-modal":
       state.modal = "";
       state.whatsappShareDraft = null;
       state.editingCourseId = null;
       state.editingChapterId = null;
+      state.editingLessonId = null;
       state.error = "";
       render();
       break;
@@ -1418,6 +1770,7 @@ async function clickAction(action, target, originalTarget) {
         state.whatsappShareDraft = null;
         state.editingCourseId = null;
         state.editingChapterId = null;
+        state.editingLessonId = null;
         state.error = "";
         render();
       }
@@ -1456,6 +1809,7 @@ async function clickAction(action, target, originalTarget) {
     case "add-lesson":
       if (!state.admin || !state.selectedCourse) break;
       state.selectedChapterId = target.dataset.chapter || "";
+      state.editingLessonId = null;
       state.modal = "lesson";
       render();
       break;
@@ -1514,18 +1868,37 @@ async function handleClick(event) {
   if (navButton) {
     state.nav = navButton.dataset.nav;
     state.selectedLesson = null;
+    if (state.admin && state.nav === "support") {
+      state.supportTarget = "";
+      state.chatText = "";
+    }
     if (state.nav === "learning") listenLessons(state.selectedCourse);
     if (state.nav === "chat" || state.nav === "support") listenChat();
     else {
       unsubscribers.get("chat0")?.();
       unsubscribers.get("chat1")?.();
+      unsubscribers.get("support-room")?.();
+      unsubscribers.get("support-inbox")?.();
       unsubscribers.delete("chat0");
       unsubscribers.delete("chat1");
+      unsubscribers.delete("support-room");
+      unsubscribers.delete("support-inbox");
       window.clearTimeout(chatExpiryTimer);
       chatExpiryTimer = null;
+      window.clearTimeout(supportReplyTimer);
+      supportReplyTimer = null;
     }
     if (state.nav === "updates") markAnnouncementsSeen();
     state.error = "";
+    render();
+    return;
+  }
+  const supportRoomButton = event.target.closest("[data-support-target]");
+  if (supportRoomButton && state.admin) {
+    state.supportTarget = supportRoomButton.dataset.supportTarget;
+    state.chatText = "";
+    state.nav = "support";
+    listenChat();
     render();
     return;
   }

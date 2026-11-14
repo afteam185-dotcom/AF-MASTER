@@ -10,7 +10,7 @@ service cloud.firestore {
         && request.auth.uid in [
           'J9BuDGBCXTced8WtkJsjDQUw94g2',
           'BrequkkRPuRVaLgmlN8i8tMmN7I2',
-          'ePEzd3F1BNXJvwteHU2TqTYshMq2'
+          'ePEzd3F1BNXJvwteHU2TqTYshMq2'  
         ];
     }
     function hasActiveProfile() {
@@ -24,8 +24,26 @@ service cloud.firestore {
     }
     function matchesStudentCourse(course) {
       return hasLearningAccess()
-        && course.grade == get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.grade
-        && course.track == get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.track;
+        && (
+          !(course.grade is list)
+          || course.grade.hasAny([get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.grade])
+        )
+        && (
+          !(course.track is list)
+          || course.track.hasAny([get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.track])
+          || course.track.hasAny(['كلاهما'])
+        )
+        && (
+          course.grade == get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.grade
+          || !(course.grade is list)
+          || course.grade.hasAny([get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.grade])
+        )
+        && (
+          course.track == get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.track
+          || !(course.track is list)
+          || course.track.hasAny([get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.track])
+          || course.track.hasAny(['كلاهما'])
+        );
     }
     function isSelf(uid) {
       return signedIn() && request.auth.uid == uid;
@@ -49,7 +67,10 @@ service cloud.firestore {
         && value <= request.time + duration.value(25, 'h');
     }
     function validChatMessageFields() {
-      return request.resource.data.keys().hasOnly([
+      return request.resource.data.keys().hasAll([
+          'senderId', 'senderName', 'text', 'kind', 'createdAt', 'expiresAt'
+        ])
+        && request.resource.data.keys().hasOnly([
           'senderId', 'senderName', 'text', 'kind', 'createdAt', 'expiresAt'
         ])
         && request.resource.data.senderId is string
@@ -59,7 +80,17 @@ service cloud.firestore {
         && request.resource.data.text.size() <= 2000
         && request.resource.data.createdAt == request.time;
     }
-    function validChatMessage(roomId) {
+    function validSupportMessageSummary(roomId, messageId, senderId, senderName, messageText, senderKind) {
+      return roomId.matches('^support_[A-Za-z0-9_-]+$')
+        && existsAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId))
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.senderId == senderId
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.senderName == senderName
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.text == messageText
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.kind == senderKind
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.expiresAt == null;
+    }
+    function validChatMessage(roomId, messageId) {
       return validChatMessageFields()
         && (
           (
@@ -67,15 +98,24 @@ service cloud.firestore {
             && request.resource.data.senderId == request.auth.uid
             && request.resource.data.senderName == 'مشرف AF MASTER'
             && request.resource.data.kind == 'admin'
-            && validMessageExpiry(request.resource.data.expiresAt)
             && (
-              roomId == 'students'
+              (
+                roomId == 'students'
+                && validMessageExpiry(request.resource.data.expiresAt)
+              )
               || (
                 roomId.matches('^support_[A-Za-z0-9_-]+$')
+                && request.resource.data.expiresAt == null
+                && exists(/databases/$(database)/documents/chatRooms/$(roomId))
                 && roomId == 'support_' + getAfter(
                   /databases/$(database)/documents/chatRooms/$(roomId)
                 ).data.studentUid
                 && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.awaitingAdminReply == false
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.adminReplyAt == request.time
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.latestSenderId == request.auth.uid
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.lastMessageId == messageId
+                && validSupportMessageSummary(roomId, messageId, request.auth.uid,
+                  'مشرف AF MASTER', request.resource.data.text, 'admin')
               )
             )
           )
@@ -95,6 +135,12 @@ service cloud.firestore {
                 && request.resource.data.expiresAt == null
                 && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.studentUid == request.auth.uid
                 && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.awaitingAdminReply == true
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.adminReplyAt == null
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.latestSenderId == request.auth.uid
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.lastMessageId == messageId
+                && validSupportMessageSummary(roomId, messageId, request.auth.uid,
+                  get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.fullName,
+                  request.resource.data.text, 'student')
               )
             )
           )
@@ -105,7 +151,7 @@ service cloud.firestore {
             && request.resource.data.senderName == 'AF MASTER'
             && request.resource.data.text == 'تم استلام رسالتك، وسيتم الرد عليك خلال 24 ساعة.'
             && request.resource.data.kind == 'system'
-            && validMessageExpiry(request.resource.data.expiresAt)
+            && request.resource.data.expiresAt == null
             && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.studentUid == request.auth.uid
             && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.awaitingAdminReply == true
           )
@@ -113,25 +159,55 @@ service cloud.firestore {
     }
     function validSupportRoom(roomId) {
       return request.resource.data.keys().hasAll([
-          'roomType', 'studentUid', 'updatedAt', 'awaitingAdminReply'
+          'roomType', 'studentUid', 'updatedAt', 'awaitingAdminReply',
+          'adminReplyAt', 'latestMessage', 'latestMessageAt',
+          'latestSenderId', 'latestSenderName', 'lastMessageId'
         ])
         && request.resource.data.keys().hasOnly([
-          'roomType', 'studentUid', 'updatedAt', 'awaitingAdminReply'
+          'roomType', 'studentUid', 'updatedAt', 'awaitingAdminReply',
+          'adminReplyAt', 'latestMessage', 'latestMessageAt',
+          'latestSenderId', 'latestSenderName', 'lastMessageId'
         ])
         && request.resource.data.roomType == 'support'
         && request.resource.data.studentUid is string
         && roomId == 'support_' + request.resource.data.studentUid
         && request.resource.data.updatedAt == request.time
         && request.resource.data.awaitingAdminReply is bool
+        && request.resource.data.latestMessage is string
+        && request.resource.data.latestMessage.size() > 0
+        && request.resource.data.latestMessage.size() <= 2000
+        && request.resource.data.latestMessageAt == request.time
+        && (request.resource.data.adminReplyAt == null
+          || request.resource.data.adminReplyAt is timestamp)
+        && request.resource.data.latestSenderId is string
+        && request.resource.data.latestSenderName is string
+        && request.resource.data.lastMessageId is string
         && (
           (
             isAdmin()
             && exists(/databases/$(database)/documents/profiles/$(request.resource.data.studentUid))
+            && request.resource.data.awaitingAdminReply == false
+            && request.resource.data.adminReplyAt == request.time
+            && request.resource.data.latestSenderId == request.auth.uid
+            && request.resource.data.latestSenderName == 'مشرف AF MASTER'
+            && validSupportMessageSummary(roomId, request.resource.data.lastMessageId,
+              request.auth.uid, 'مشرف AF MASTER', request.resource.data.latestMessage, 'admin')
+            && (!exists(/databases/$(database)/documents/chatRooms/$(roomId))
+              || resource.data.studentUid == request.resource.data.studentUid)
           )
           || (
             hasActiveProfile()
             && request.resource.data.studentUid == request.auth.uid
             && request.resource.data.awaitingAdminReply == true
+            && request.resource.data.adminReplyAt == null
+            && request.resource.data.latestSenderId == request.auth.uid
+            && request.resource.data.latestSenderName
+              == get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.fullName
+            && validSupportMessageSummary(roomId, request.resource.data.lastMessageId,
+              request.auth.uid, request.resource.data.latestSenderName,
+              request.resource.data.latestMessage, 'student')
+            && (!exists(/databases/$(database)/documents/chatRooms/$(roomId))
+              || resource.data.studentUid == request.auth.uid)
           )
         );
     }
@@ -329,22 +405,23 @@ service cloud.firestore {
       allow delete: if false;
       match /messages/{messageId} {
         allow read: if isAdmin()
-          || ((roomId == 'students' || roomId == 'support_' + request.auth.uid)
+          || (roomId == 'support_' + request.auth.uid && hasActiveProfile())
+          || (roomId == 'students'
             && hasActiveProfile()
             && (resource.data.expiresAt == null || resource.data.expiresAt > request.time));
-        allow create: if validChatMessage(roomId);
-        allow update: if isAdmin()
-          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expiresAt'])
-          && validMessageExpiry(request.resource.data.expiresAt);
-        allow delete: if isAdmin();
+        allow create: if validChatMessage(roomId, messageId);
+        allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expiresAt'])
+          && request.resource.data.expiresAt == null
+          && (isAdmin() || (roomId == 'support_' + request.auth.uid && hasActiveProfile()));
+        allow delete: if isAdmin() && roomId == 'students';
       }
     }
 
     match /announcements/{announcementId} {
-      allow read: if isAdmin() || (hasActiveProfile() && resource.data.expiresAt > request.time);
+      allow read: if isAdmin() || (hasActiveProfile() && resource.data.hidden != true && resource.data.expiresAt > request.time);
       allow create: if isAdmin()
         && request.resource.data.keys().hasOnly([
-          'title', 'body', 'createdAt', 'expiresAt', 'createdBy'
+          'title', 'body', 'createdAt', 'expiresAt', 'createdBy', 'hidden'
         ])
         && request.resource.data.title is string
         && request.resource.data.title.size() > 0
@@ -356,7 +433,8 @@ service cloud.firestore {
         && request.resource.data.createdBy == request.auth.uid
         && request.resource.data.expiresAt is timestamp
         && request.resource.data.expiresAt > request.time
-        && request.resource.data.expiresAt <= request.time + duration.value(73, 'h');
+        && request.resource.data.expiresAt <= request.time + duration.value(73, 'h')
+        && request.resource.data.hidden is bool;
       allow update, delete: if isAdmin();
       match /seen/{uid} {
         allow read: if isSelf(uid) || isAdmin();
