@@ -1569,7 +1569,6 @@ async function handleSubmit(event) {
         }
         state.modal = "";
         state.error = "";
-        startStudentSession(credential.user, profileSnapshot.data());
         break;
       }
       case "register": {
