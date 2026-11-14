@@ -753,7 +753,8 @@ function listenSharedData() {
       });
     } else {
       listen("courses-student", query(
-        collection(db, "studentCatalog", currentAudienceKey(state.profile), "courses"),
+        collection(db, "courses"),
+        where("audienceKeys", "array-contains", currentAudienceKey(state.profile)),
       ), (snapshot) => {
         updateCourses(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
       });
@@ -807,18 +808,22 @@ function listenLessons(course) {
   state.chapters = [];
   state.lessons = [];
   const audienceKey = !state.admin && state.profile ? currentAudienceKey(state.profile) : "";
-  const chapterCollection = state.admin
-    ? collection(db, "chapters")
-    : collection(db, "studentCatalog", audienceKey, "courses", course.id, "chapters");
-  const lessonCollection = state.admin
-    ? collection(db, "lessons")
-    : collection(db, "studentCatalog", audienceKey, "courses", course.id, "lessons");
+  const chapterCollection = collection(db, "chapters");
+  const lessonCollection = collection(db, "lessons");
   const chapterQuery = state.admin
     ? query(chapterCollection, where("courseId", "==", course.id))
-    : query(chapterCollection);
+    : query(
+      chapterCollection,
+      where("courseId", "==", course.id),
+      where("audienceKeys", "array-contains", audienceKey),
+    );
   const lessonQuery = state.admin
     ? query(lessonCollection, where("courseId", "==", course.id))
-    : query(lessonCollection);
+    : query(
+      lessonCollection,
+      where("courseId", "==", course.id),
+      where("audienceKeys", "array-contains", audienceKey),
+    );
   listen("chapters", chapterQuery, (snapshot) => {
     state.chapters = snapshot.docs
       .map((item) => ({ id: item.id, ...item.data() }))
