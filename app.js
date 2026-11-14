@@ -923,6 +923,17 @@ async function writeChatMessage(value) {
   await addDoc(messagesRef, message);
 }
 
+function startStudentSession(user, profile) {
+  state.user = user;
+  state.admin = false;
+  state.profile = profile;
+  state.device = { status: "active" };
+  state.deviceError = "";
+  maybeShowShareReturnConfirmation();
+  listenProfile(user.uid);
+  listenSharedData();
+}
+
 onAuthStateChanged(auth, async (user) => {
   clearSubscriptions();
   state.user = user;
@@ -961,15 +972,10 @@ onAuthStateChanged(auth, async (user) => {
     state.admin = isAdminAccount && token.signInProvider === "google.com";
     if (!state.admin) {
       const profile = await getDoc(doc(db, "profiles", user.uid));
-      if (profile.exists()) state.profile = profile.data();
+      if (profile.exists()) startStudentSession(user, profile.data());
     }
     if (state.admin) {
       state.device = { status: "active" };
-      listenSharedData();
-    } else if (state.profile) {
-      state.device = { status: "active" };
-      maybeShowShareReturnConfirmation();
-      listenProfile(user.uid);
       listenSharedData();
     }
   } catch (error) {
@@ -1254,7 +1260,14 @@ function chatView(support) {
   return `<section class="chat-page ${support ? "support-chat" : "student-chat"}"><div class="page-title-row"><div><span class="eyebrow">مساحة التواصل</span><h1>${h(title)}</h1><p>${description}</p></div><div class="chat-page-actions">${backButton}<span class="privacy-badge">♢ ${support ? "سجل خاص محفوظ" : "رسائل مؤقتة"}</span></div></div>
     <div class="chat-card"><div class="chat-head"><div class="chat-head-icon">◌</div><div><b>${h(title)}</b><small>${support ? "سجل المحادثة محفوظ للطرفين" : "تُحذف رسائل الشات العام بعد 24 ساعة"}</small></div><span class="online-dot"></span></div>
     ${supportNotice}
-    <div class="chat-stream" aria-label="رسائل المحادثة">${state.chatMessages.length ? state.chatMessages.map((message) => `<div class="chat-message ${message.kind === "system" ? "system-message" : message.senderId === state.user.uid ? "mine" : "peer"}" data-chat-message="${h(message.id)}"><div class="message-meta"><b>${h(message.senderName)}</b><small>${h(timestampText(message.createdAt, true))}</small></div><p>${h(message.text)}</p>${state.admin && !support && message.kind !== "system" ? `<button class="message-delete" data-delete-message="${h(message.id)}">×</button>` : ""}</div>`).join("") : emptyState("◌", "ابدأ المحادثة", "اكتب أول رسالة وابدأ التواصل.")}</div>
+    <div class="chat-stream" aria-label="رسائل المحادثة">${state.chatMessages.length ? state.chatMessages.map((message) => {
+      const messageClass = message.kind === "system"
+        ? "system-message"
+        : message.senderId === state.user.uid
+          ? "mine chat-message-own"
+          : "peer chat-message-other";
+      return `<div class="chat-message ${messageClass}" data-chat-message="${h(message.id)}"><div class="message-meta"><b>${h(message.senderName)}</b><small>${h(timestampText(message.createdAt, true))}</small></div><p>${h(message.text)}</p>${state.admin && !support && message.kind !== "system" ? `<button class="message-delete" data-delete-message="${h(message.id)}">×</button>` : ""}</div>`;
+    }).join("") : emptyState("◌", "ابدأ المحادثة", "اكتب أول رسالة وابدأ التواصل.")}</div>
     <form class="chat-composer" data-form="chat"><input name="text" value="${h(state.chatText)}" placeholder="${ended && state.supportDraftOpen ? "اكتب رسالتك لبدء دردشة جديدة..." : "اكتب رسالتك هنا..."}" maxlength="2000" ${!canSend ? "disabled" : ""}><button class="send-button" ${state.busy || !canSend ? "disabled" : ""} aria-label="إرسال الرسالة">➤</button></form></div></section>`;
 }
 
@@ -1393,9 +1406,15 @@ async function handleSubmit(event) {
       case "code-login": {
         const code = latinDigits(data.code).trim();
         if (!/^\d{24}$/.test(code)) throw new Error("أدخل كود الدخول المكوّن من 24 رقماً.");
-        await signInWithEmailAndPassword(auth, loginEmailForCode(code), code);
+        const credential = await signInWithEmailAndPassword(auth, loginEmailForCode(code), code);
+        await credential.user.getIdToken(true);
+        const profileSnapshot = await getDoc(doc(db, "profiles", credential.user.uid));
+        if (!profileSnapshot.exists()) {
+          throw new Error("تم تسجيل الدخول بالكود، لكن لم نعثر على ملف الطالب المرتبط به. تواصل مع المشرف.");
+        }
         state.modal = "";
         state.error = "";
+        startStudentSession(credential.user, profileSnapshot.data());
         break;
       }
       case "register": {

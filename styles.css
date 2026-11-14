@@ -259,6 +259,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .student-chat .chat-message { padding: 11px 14px; border-radius: 15px 15px 15px 5px; }
 .student-chat .chat-message.mine { border-color: #c4e8bd; border-radius: 15px 15px 5px 15px; background: #d9fdd3; }
 .student-chat .chat-message.peer { background: #fff; }
+.student-chat .chat-message.chat-message-own { align-self: flex-end; color: #183b2c; border-color: #b7e5ad; border-radius: 15px 15px 5px 15px; background: #d9fdd3; }
+.student-chat .chat-message.chat-message-other { align-self: flex-start; color: #34445a; border-color: #e0e5e9; border-radius: 15px 15px 15px 5px; background: #fff; }
+.student-chat .chat-message.chat-message-own p { color: #183b2c; }
+.student-chat .chat-message.chat-message-other p { color: #46576c; }
 .student-chat .message-meta b { color: #258768; }
 .message-meta { display: flex; align-items: center; gap: 9px; margin-bottom: 5px; }
 .message-meta b { color: #188ba5; font-size: 8px; font-weight: 600; }
