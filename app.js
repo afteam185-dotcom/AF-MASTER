@@ -2,6 +2,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/11.10.0/fireba
 import {
   EmailAuthProvider,
   GoogleAuthProvider,
+  connectAuthEmulator,
   getAuth,
   linkWithCredential,
   onAuthStateChanged,
@@ -13,6 +14,7 @@ import {
   addDoc,
   collection,
   collectionGroup,
+  connectFirestoreEmulator,
   deleteDoc,
   doc,
   getDoc,
@@ -33,9 +35,22 @@ import {
 import { getFirestore } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
 import { adminUids, firebaseConfig } from "./firebase-config.js";
 
-const app = initializeApp(firebaseConfig);
+const useEmulators = ["localhost", "127.0.0.1"].includes(location.hostname)
+  && new URLSearchParams(location.search).get("emulator") === "1";
+const app = initializeApp(useEmulators
+  ? {
+    ...firebaseConfig,
+    apiKey: "demo-api-key",
+    authDomain: "demo-af-master.firebaseapp.com",
+    projectId: "demo-af-master",
+  }
+  : firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+if (useEmulators) {
+  connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
+  connectFirestoreEmulator(db, "127.0.0.1", 8080);
+}
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 const root = document.querySelector("#root");
@@ -137,13 +152,13 @@ function createNumericLoginCode() {
 }
 
 function loginEmailForCode(code) {
-  return `${code}@${firebaseConfig.projectId}.firebaseapp.com`;
+  return `${code}@${app.options.projectId}.firebaseapp.com`;
 }
 
 function linkedLoginCode(user) {
   const provider = user?.providerData?.find((item) => item.providerId === "password");
   const email = provider?.email || "";
-  const suffix = `@${firebaseConfig.projectId}.firebaseapp.com`;
+  const suffix = `@${app.options.projectId}.firebaseapp.com`;
   const code = email.endsWith(suffix) ? email.slice(0, -suffix.length) : "";
   return /^\d{24}$/.test(code) ? code : null;
 }
@@ -353,7 +368,7 @@ async function migrateCourseAudience(course) {
 }
 
 function learnCatalogCount() {
-  return Math.max(Number(state.catalogCount || 0), state.courses.length || 0, 8);
+  return Number(state.catalogCount || 0);
 }
 
 function studentCommunityCount() {
@@ -375,6 +390,30 @@ function clearSubscriptions() {
 function listen(key, reference, next, error = fail) {
   unsubscribers.get(key)?.();
   unsubscribers.set(key, onSnapshot(reference, next, error));
+}
+
+let catalogCountWrite = null;
+let catalogCountSync = Promise.resolve();
+function syncCatalogCount(count) {
+  if (catalogCountWrite === count) return;
+  catalogCountWrite = count;
+  catalogCountSync = catalogCountSync.then(() => setDoc(doc(db, "publicStats", "catalog"), {
+    courseCount: count,
+    updatedAt: serverTimestamp(),
+  })).catch((error) => {
+    if (catalogCountWrite === count) catalogCountWrite = null;
+    console.error("Could not sync the public course count.", error);
+    fail(error);
+  });
+}
+
+function listenCatalogCount() {
+  listen("catalog-count", doc(db, "publicStats", "catalog"), (snapshot) => {
+    state.catalogCount = snapshot.exists()
+      ? Math.max(0, Number(snapshot.data().courseCount) || 0)
+      : 0;
+    render();
+  });
 }
 
 function supportReplyDeadline(room) {
@@ -562,13 +601,14 @@ function listenSharedData() {
     window.clearTimeout(announcementExpiryTimer);
     announcementExpiryTimer = null;
     for (const key of [...unsubscribers.keys()]) {
-      if (key === "announcements" || key === "courses" || key === "courses-student") {
+      if (key === "announcements" || key === "courses" || key === "courses-student" || key === "catalog-count") {
         unsubscribers.get(key)?.();
         unsubscribers.delete(key);
       }
     }
     return;
   }
+  listenCatalogCount();
   const canReadCourses = state.admin || Number(state.profile.whatsappShareCount || 0) >= 10;
   for (const key of [...unsubscribers.keys()]) {
     if (key === "courses" || key === "courses-student") {
@@ -578,11 +618,13 @@ function listenSharedData() {
   }
   if (!canReadCourses) {
     state.courses = [];
-    state.catalogCount = Math.max(state.catalogCount, learnCatalogCount());
   } else {
     const updateCourses = (records) => {
       state.courses = state.admin ? records : records.filter((course) => courseMatchesProfile(course));
-      state.catalogCount = Math.max(state.catalogCount, state.courses.length || 0);
+      if (state.admin) {
+        state.catalogCount = records.length;
+        syncCatalogCount(records.length);
+      }
       if (state.selectedCourse) {
         state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
         if (!state.selectedCourse) {

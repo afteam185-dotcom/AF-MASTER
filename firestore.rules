@@ -440,6 +440,18 @@ service cloud.firestore {
       }
     }
 
+    match /publicStats/{statId} {
+      allow get: if signedIn() && statId == 'catalog';
+      allow list: if false;
+      allow create, update: if isAdmin()
+        && statId == 'catalog'
+        && request.resource.data.keys().hasOnly(['courseCount', 'updatedAt'])
+        && request.resource.data.courseCount is int
+        && request.resource.data.courseCount >= 0
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+    }
+
     match /devices/{uid}/sessions/{deviceId} {
       allow read: if isSelf(uid) || isAdmin();
       allow write: if false;
