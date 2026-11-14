@@ -77,6 +77,7 @@ const state = {
   nav: "home",
   courses: [],
   catalogCount: 0,
+  studentCount: 0,
   chapters: [],
   lessons: [],
   selectedCourse: null,
@@ -331,9 +332,100 @@ function currentAudienceKey(profile) {
 
 const audienceMigrations = new Set();
 const migratedAudienceCourses = new Set();
+function audienceCourseRef(audienceKey, courseId) {
+  return doc(db, "studentCatalog", audienceKey, "courses", courseId);
+}
+
+function audienceContentRef(audienceKey, courseId, collectionName, contentId) {
+  return doc(db, "studentCatalog", audienceKey, "courses", courseId, collectionName, contentId);
+}
+
+async function commitAudienceIndexOperations(operations) {
+  for (let offset = 0; offset < operations.length; offset += 450) {
+    const batch = writeBatch(db);
+    for (const operation of operations.slice(offset, offset + 450)) {
+      if (operation.delete) batch.delete(operation.ref);
+      else batch.set(operation.ref, operation.data);
+    }
+    await batch.commit();
+  }
+}
+
+async function syncAudienceIndex(course, chapters, lessons, previousAudienceKeys = []) {
+  const audienceKeys = courseAudienceKeys(course);
+  const currentKeys = new Set(audienceKeys);
+  const staleKeys = new Set(previousAudienceKeys.filter((key) => !currentKeys.has(key)));
+  const operations = [];
+
+  for (const audienceKey of audienceKeys) {
+    operations.push({
+      ref: audienceCourseRef(audienceKey, course.id),
+      data: { ...course, audienceKeys },
+    });
+  }
+  for (const [collectionName, snapshot] of [["chapters", chapters], ["lessons", lessons]]) {
+    for (const item of snapshot.docs) {
+      const itemData = item.data();
+      const itemKeys = Array.isArray(itemData.audienceKeys) && itemData.audienceKeys.length
+        ? itemData.audienceKeys
+        : previousAudienceKeys;
+      itemKeys.forEach((key) => {
+        if (!currentKeys.has(key)) staleKeys.add(key);
+      });
+      for (const audienceKey of audienceKeys) {
+        operations.push({
+          ref: audienceContentRef(audienceKey, course.id, collectionName, item.id),
+          data: { ...itemData, audienceKeys },
+        });
+      }
+      for (const audienceKey of itemKeys) {
+        if (!currentKeys.has(audienceKey)) {
+          operations.push({
+            ref: audienceContentRef(audienceKey, course.id, collectionName, item.id),
+            delete: true,
+          });
+        }
+      }
+    }
+  }
+  for (const audienceKey of staleKeys) {
+    operations.push({ ref: audienceCourseRef(audienceKey, course.id), delete: true });
+  }
+  await commitAudienceIndexOperations(operations);
+}
+
+async function syncAudienceItems(course, collectionName, documents) {
+  const audienceKeys = courseAudienceKeys(course);
+  if (!audienceKeys.length) return;
+  const currentKeys = new Set(audienceKeys);
+  const operations = [];
+  for (const item of documents) {
+    const itemData = item.data();
+    for (const audienceKey of audienceKeys) {
+      operations.push({
+        ref: audienceContentRef(audienceKey, course.id, collectionName, item.id),
+        data: { ...itemData, audienceKeys },
+      });
+    }
+    for (const audienceKey of itemData.audienceKeys || []) {
+      if (!currentKeys.has(audienceKey)) {
+        operations.push({
+          ref: audienceContentRef(audienceKey, course.id, collectionName, item.id),
+          delete: true,
+        });
+      }
+    }
+  }
+  await commitAudienceIndexOperations(operations);
+}
+
 async function migrateCourseAudience(course) {
   const audienceKeys = courseAudienceKeys(course);
-  const migrationKey = `${course.id}:${JSON.stringify(audienceKeys)}`;
+  const previousCourse = state.courses.find((item) => item.id === course.id);
+  const previousAudienceKeys = previousCourse
+    ? courseAudienceKeys(previousCourse)
+    : Array.isArray(course.audienceKeys) ? course.audienceKeys : audienceKeys;
+  const migrationKey = `${course.id}:${JSON.stringify(audienceKeys)}:${course.title}:${course.description || ""}`;
   if (!audienceKeys.length || audienceMigrations.has(migrationKey) || migratedAudienceCourses.has(migrationKey)) return;
   audienceMigrations.add(migrationKey);
   try {
@@ -345,7 +437,7 @@ async function migrateCourseAudience(course) {
       getDocs(query(collection(db, "chapters"), where("courseId", "==", course.id))),
       getDocs(query(collection(db, "lessons"), where("courseId", "==", course.id))),
     ]);
-    for (const [collectionName, snapshot] of [["chapters", chapters], ["lessons", lessons]]) {
+    for (const snapshot of [chapters, lessons]) {
       for (let offset = 0; offset < snapshot.docs.length; offset += 450) {
         const batch = writeBatch(db);
         let changed = false;
@@ -358,6 +450,7 @@ async function migrateCourseAudience(course) {
       }
     }
     await Promise.all(updates);
+    await syncAudienceIndex(course, chapters, lessons, previousAudienceKeys);
     migratedAudienceCourses.add(migrationKey);
   } catch (error) {
     console.error(`Could not update audience filters for course ${course.id}.`, error);
@@ -372,8 +465,7 @@ function learnCatalogCount() {
 }
 
 function studentCommunityCount() {
-  const realCount = Number(state.students?.length || 0);
-  return Math.max(realCount > 0 ? realCount * 3 : 120, 120);
+  return Math.max(0, Number(state.studentCount) || 0) * 3;
 }
 
 function clearSubscriptions() {
@@ -392,17 +484,22 @@ function listen(key, reference, next, error = fail) {
   unsubscribers.set(key, onSnapshot(reference, next, error));
 }
 
-let catalogCountWrite = null;
-let catalogCountSync = Promise.resolve();
-function syncCatalogCount(count) {
-  if (catalogCountWrite === count) return;
-  catalogCountWrite = count;
-  catalogCountSync = catalogCountSync.then(() => setDoc(doc(db, "publicStats", "catalog"), {
-    courseCount: count,
+let publicStatsWrite = "";
+let publicStatsSync = Promise.resolve();
+function syncPublicStats() {
+  const counts = {
+    courseCount: Math.max(0, Number(state.catalogCount) || 0),
+    studentCount: Math.max(0, Number(state.studentCount) || 0),
+  };
+  const signature = `${counts.courseCount}:${counts.studentCount}`;
+  if (publicStatsWrite === signature) return;
+  publicStatsWrite = signature;
+  publicStatsSync = publicStatsSync.then(() => setDoc(doc(db, "publicStats", "catalog"), {
+    ...counts,
     updatedAt: serverTimestamp(),
   })).catch((error) => {
-    if (catalogCountWrite === count) catalogCountWrite = null;
-    console.error("Could not sync the public course count.", error);
+    if (publicStatsWrite === signature) publicStatsWrite = "";
+    console.error("Could not sync public platform statistics.", error);
     fail(error);
   });
 }
@@ -411,6 +508,9 @@ function listenCatalogCount() {
   listen("catalog-count", doc(db, "publicStats", "catalog"), (snapshot) => {
     state.catalogCount = snapshot.exists()
       ? Math.max(0, Number(snapshot.data().courseCount) || 0)
+      : 0;
+    state.studentCount = snapshot.exists()
+      ? Math.max(0, Number(snapshot.data().studentCount) || 0)
       : 0;
     render();
   });
@@ -597,6 +697,7 @@ function listenSharedData() {
   if (!state.admin && (!state.profile || !state.profile.isActive)) {
     state.courses = [];
     state.catalogCount = 0;
+    state.studentCount = 0;
     state.announcements = [];
     window.clearTimeout(announcementExpiryTimer);
     announcementExpiryTimer = null;
@@ -623,7 +724,7 @@ function listenSharedData() {
       state.courses = state.admin ? records : records.filter((course) => courseMatchesProfile(course));
       if (state.admin) {
         state.catalogCount = records.length;
-        syncCatalogCount(records.length);
+        syncPublicStats();
       }
       if (state.selectedCourse) {
         state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
@@ -643,8 +744,7 @@ function listenSharedData() {
       });
     } else {
       listen("courses-student", query(
-        collection(db, "courses"),
-        where("audienceKeys", "array-contains", currentAudienceKey(state.profile)),
+        collection(db, "studentCatalog", currentAudienceKey(state.profile), "courses"),
         orderBy("createdAt", "desc"),
       ), (snapshot) => {
         updateCourses(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
@@ -656,6 +756,8 @@ function listenSharedData() {
   if (state.admin) {
     listen("students", query(collection(db, "profiles"), orderBy("createdAt", "desc")), (snapshot) => {
       state.students = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      state.studentCount = state.students.length;
+      syncPublicStats();
       render();
     });
     listen("deviceCounts", query(collectionGroup(db, "sessions"), where("active", "==", true)), (snapshot) => {
@@ -695,22 +797,37 @@ function listenLessons(course) {
   }
   state.chapters = [];
   state.lessons = [];
-  const courseFilters = [where("courseId", "==", course.id)];
-  if (!state.admin && state.profile) {
-    courseFilters.push(where("audienceKeys", "array-contains", currentAudienceKey(state.profile)));
-  }
-  listen("chapters", query(collection(db, "chapters"), ...courseFilters), (snapshot) => {
+  const audienceKey = !state.admin && state.profile ? currentAudienceKey(state.profile) : "";
+  const chapterCollection = state.admin
+    ? collection(db, "chapters")
+    : collection(db, "studentCatalog", audienceKey, "courses", course.id, "chapters");
+  const lessonCollection = state.admin
+    ? collection(db, "lessons")
+    : collection(db, "studentCatalog", audienceKey, "courses", course.id, "lessons");
+  const chapterQuery = state.admin
+    ? query(chapterCollection, where("courseId", "==", course.id))
+    : query(chapterCollection);
+  const lessonQuery = state.admin
+    ? query(lessonCollection, where("courseId", "==", course.id))
+    : query(lessonCollection);
+  listen("chapters", chapterQuery, (snapshot) => {
     state.chapters = snapshot.docs
       .map((item) => ({ id: item.id, ...item.data() }))
       .sort((a, b) => Number(a.number) - Number(b.number)
         || Number(a.type === "exam") - Number(b.type === "exam"));
-    if (state.admin) migrateCourseAudience(course);
+    if (state.admin) {
+      syncAudienceItems(course, "chapters", snapshot.docs).catch(fail);
+      migrateCourseAudience(course);
+    }
     sortCourseLessons();
     render();
   });
-  listen("lessons", query(collection(db, "lessons"), ...courseFilters), (snapshot) => {
+  listen("lessons", lessonQuery, (snapshot) => {
     state.lessons = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-    if (state.admin) migrateCourseAudience(course);
+    if (state.admin) {
+      syncAudienceItems(course, "lessons", snapshot.docs).catch(fail);
+      migrateCourseAudience(course);
+    }
     sortCourseLessons();
     render();
   });
