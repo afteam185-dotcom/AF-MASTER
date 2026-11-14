@@ -44,6 +44,39 @@ service cloud.firestore {
         && (matchesCourseAudience(course, student)
           || (matchesCourseGrade(course, student) && matchesCourseTrack(course, student)));
     }
+    function matchesStudentAudienceKey(audienceKey) {
+      let student = get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data;
+      return audienceKey == student.grade + '|' + student.track;
+    }
+    function validStudentCounterCreate(statId) {
+      let profilePath = /databases/$(database)/documents/profiles/$(request.auth.uid);
+      return statId == 'catalog'
+        && signedIn()
+        && request.auth.token.firebase.sign_in_provider == 'google.com'
+        && request.resource.data.keys().hasOnly(['studentCount', 'updatedAt'])
+        && request.resource.data.studentCount == 1
+        && request.resource.data.updatedAt == request.time
+        && !exists(profilePath)
+        && existsAfter(profilePath)
+        && getAfter(profilePath).data.uid == request.auth.uid
+        && getAfter(profilePath).data.createdAt == request.time;
+    }
+    function validStudentCounterIncrement(statId) {
+      let profilePath = /databases/$(database)/documents/profiles/$(request.auth.uid);
+      return statId == 'catalog'
+        && signedIn()
+        && request.auth.token.firebase.sign_in_provider == 'google.com'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'studentCount', 'updatedAt'
+        ])
+        && request.resource.data.studentCount is int
+        && request.resource.data.studentCount == resource.data.get('studentCount', 0) + 1
+        && request.resource.data.updatedAt == request.time
+        && !exists(profilePath)
+        && existsAfter(profilePath)
+        && getAfter(profilePath).data.uid == request.auth.uid
+        && getAfter(profilePath).data.createdAt == request.time;
+    }
     function isSelf(uid) {
       return signedIn() && request.auth.uid == uid;
     }
@@ -396,6 +429,21 @@ service cloud.firestore {
       allow read: if isAdmin() || matchesStudentCourse(resource.data);
       allow write: if isAdmin();
     }
+    match /studentCatalog/{audienceKey}/courses/{courseId} {
+      allow read: if isAdmin()
+        || (hasLearningAccess() && matchesStudentAudienceKey(audienceKey));
+      allow write: if isAdmin();
+      match /chapters/{chapterId} {
+        allow read: if isAdmin()
+          || (hasLearningAccess() && matchesStudentAudienceKey(audienceKey));
+        allow write: if isAdmin();
+      }
+      match /lessons/{lessonId} {
+        allow read: if isAdmin()
+          || (hasLearningAccess() && matchesStudentAudienceKey(audienceKey));
+        allow write: if isAdmin();
+      }
+    }
 
     match /chatRooms/{roomId} {
       allow read: if isAdmin()
@@ -443,12 +491,24 @@ service cloud.firestore {
     match /publicStats/{statId} {
       allow get: if signedIn() && statId == 'catalog';
       allow list: if false;
-      allow create, update: if isAdmin()
+      allow create: if (isAdmin()
         && statId == 'catalog'
-        && request.resource.data.keys().hasOnly(['courseCount', 'updatedAt'])
+        && request.resource.data.keys().hasOnly(['courseCount', 'studentCount', 'updatedAt'])
         && request.resource.data.courseCount is int
         && request.resource.data.courseCount >= 0
-        && request.resource.data.updatedAt == request.time;
+        && request.resource.data.studentCount is int
+        && request.resource.data.studentCount >= 0
+        && request.resource.data.updatedAt == request.time)
+        || validStudentCounterCreate(statId);
+      allow update: if (isAdmin()
+        && statId == 'catalog'
+        && request.resource.data.keys().hasOnly(['courseCount', 'studentCount', 'updatedAt'])
+        && request.resource.data.courseCount is int
+        && request.resource.data.courseCount >= 0
+        && request.resource.data.studentCount is int
+        && request.resource.data.studentCount >= 0
+        && request.resource.data.updatedAt == request.time)
+        || validStudentCounterIncrement(statId);
       allow delete: if false;
     }
 

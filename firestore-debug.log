@@ -1,4 +1,4 @@
-Nov 14, 2026 9:05:26 PM com.google.cloud.datastore.emulator.firestore.websocket.WebSocketServer start
+Nov 14, 2026 9:21:56 PM com.google.cloud.datastore.emulator.firestore.websocket.WebSocketServer start
 INFO: Started WebSocket server on ws://127.0.0.1:9150
 
 API endpoint: http://127.0.0.1:8080
@@ -16,17 +16,17 @@ If you are running a Firestore in Datastore Mode project, run:
 Note: Support for Datastore Mode is in preview. If you encounter any bugs please file at https://github.com/firebase/firebase-tools/issues.
 Dev App Server is now running.
 
-Nov 14, 2026 9:06:17 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+Nov 14, 2026 9:23:08 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
 INFO: Detected HTTP/2 connection.
-Nov 14, 2026 9:06:51 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+Nov 14, 2026 9:25:55 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
 INFO: Detected non-HTTP/2 connection.
-Nov 14, 2026 9:06:52 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+Nov 14, 2026 9:25:56 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
 INFO: Detected HTTP/2 connection.
-Nov 14, 2026 9:06:53 PM com.google.cloud.datastore.emulator.impl.util.WrappedStreamObserver onError
+Nov 14, 2026 9:25:57 PM com.google.cloud.datastore.emulator.impl.util.WrappedStreamObserver onError
 WARNING: Operation failed: 
-false for 'list' @ L391, false for 'list' @ L494
+false for 'list' @ L409, false for 'list' @ L555
 com.google.cloud.datastore.core.exception.DatastoreException: 
-false for 'list' @ L391, false for 'list' @ L494
+false for 'list' @ L409, false for 'list' @ L555
 	at com.google.cloud.datastore.core.exception.DatastoreException$Builder.build(DatastoreException.java:152)
 	at com.google.cloud.datastore.emulator.impl.rules.DefaultEmulatorRulesAuthorizer.verboseError(DefaultEmulatorRulesAuthorizer.java:349)
 	at com.google.cloud.datastore.emulator.impl.rules.DefaultEmulatorRulesAuthorizer.withVerboseErrors(DefaultEmulatorRulesAuthorizer.java:326)
@@ -36,13 +36,13 @@ false for 'list' @ L391, false for 'list' @ L494
 	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.lambda$query$0(FirestoreEmulatorHelper.java:680)
 	at com.google.cloud.datastore.emulator.impl.transactions.EmulatorTransactionManager$ReadOnlyTransaction.fold(EmulatorTransactionManager.java:492)
 	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.query(FirestoreEmulatorHelper.java:678)
-	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1.runQueryStandardEdition(CloudFirestoreV1.java:742)
-	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1.runQuery(CloudFirestoreV1.java:717)
-	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1Router.runQuery(CloudFirestoreV1Router.java:190)
-	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter$1.lambda$runQuery$0(FirestoreV1GrpcAdapter.java:178)
-	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter.streaming(FirestoreV1GrpcAdapter.java:82)
-	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter$1.runQuery(FirestoreV1GrpcAdapter.java:178)
-	at com.google.firestore.v1.FirestoreGrpc$MethodHandlers.invoke(FirestoreGrpc.java:1412)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1.listDocuments(CloudFirestoreV1.java:377)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1Router.listDocuments(CloudFirestoreV1Router.java:138)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1Router.getOrListDocuments(CloudFirestoreV1Router.java:122)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter$1.lambda$getOrListDocuments$0(FirestoreV1GrpcAdapter.java:108)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter.unary(FirestoreV1GrpcAdapter.java:72)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter$1.getOrListDocuments(FirestoreV1GrpcAdapter.java:108)
+	at com.google.firestore.v1.FirestoreGrpc$MethodHandlers.invoke(FirestoreGrpc.java:1376)
 	at io.grpc.stub.ServerCalls$UnaryServerCallHandler$UnaryServerCallListener.onHalfClose(ServerCalls.java:182)
 	at io.grpc.PartialForwardingServerCallListener.onHalfClose(PartialForwardingServerCallListener.java:35)
 	at io.grpc.ForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:23)
@@ -60,10 +60,50 @@ false for 'list' @ L391, false for 'list' @ L494
 	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
 	at java.base/java.lang.Thread.run(Thread.java:1583)
 
-Nov 14, 2026 9:06:53 PM io.gapi.emulators.netty.HttpHandler$1 onError
+Nov 14, 2026 9:25:57 PM io.gapi.emulators.netty.HttpHandler$1 onError
 INFO: Exception when handling request: PERMISSION_DENIED: 
-false for 'list' @ L391, false for 'list' @ L494
-Nov 14, 2026 9:06:54 PM io.netty.channel.DefaultChannelPipeline onUnhandledInboundException
+false for 'list' @ L409, false for 'list' @ L555
+Nov 14, 2026 9:25:58 PM com.google.cloud.datastore.emulator.impl.util.WrappedStreamObserver onError
+WARNING: Operation failed: 
+false for 'get' @ L383, false for 'get' @ L555
+com.google.cloud.datastore.core.exception.DatastoreException: 
+false for 'get' @ L383, false for 'get' @ L555
+	at com.google.cloud.datastore.core.exception.DatastoreException$Builder.build(DatastoreException.java:152)
+	at com.google.cloud.datastore.emulator.impl.rules.DefaultEmulatorRulesAuthorizer.verboseError(DefaultEmulatorRulesAuthorizer.java:349)
+	at com.google.cloud.datastore.emulator.impl.rules.DefaultEmulatorRulesAuthorizer.withVerboseErrors(DefaultEmulatorRulesAuthorizer.java:326)
+	at com.google.cloud.datastore.emulator.impl.rules.DefaultEmulatorRulesAuthorizer.checkLookup(DefaultEmulatorRulesAuthorizer.java:157)
+	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.snapshotRead(FirestoreEmulatorHelper.java:318)
+	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.lambda$read$0(FirestoreEmulatorHelper.java:265)
+	at com.google.cloud.datastore.emulator.impl.transactions.EmulatorTransactionManager$ReadOnlyTransaction.fold(EmulatorTransactionManager.java:492)
+	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.read(FirestoreEmulatorHelper.java:264)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1.getDocument(CloudFirestoreV1.java:338)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1Router.getDocument(CloudFirestoreV1Router.java:131)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1Router.getOrListDocuments(CloudFirestoreV1Router.java:125)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter$1.lambda$getOrListDocuments$0(FirestoreV1GrpcAdapter.java:108)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter.unary(FirestoreV1GrpcAdapter.java:72)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter$1.getOrListDocuments(FirestoreV1GrpcAdapter.java:108)
+	at com.google.firestore.v1.FirestoreGrpc$MethodHandlers.invoke(FirestoreGrpc.java:1376)
+	at io.grpc.stub.ServerCalls$UnaryServerCallHandler$UnaryServerCallListener.onHalfClose(ServerCalls.java:182)
+	at io.grpc.PartialForwardingServerCallListener.onHalfClose(PartialForwardingServerCallListener.java:35)
+	at io.grpc.ForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:23)
+	at io.grpc.ForwardingServerCallListener$SimpleForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:40)
+	at io.grpc.Contexts$ContextualizedServerCallListener.onHalfClose(Contexts.java:86)
+	at io.grpc.PartialForwardingServerCallListener.onHalfClose(PartialForwardingServerCallListener.java:35)
+	at io.grpc.ForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:23)
+	at io.grpc.ForwardingServerCallListener$SimpleForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:40)
+	at io.grpc.Contexts$ContextualizedServerCallListener.onHalfClose(Contexts.java:86)
+	at io.grpc.internal.ServerCallImpl$ServerStreamListenerImpl.halfClosed(ServerCallImpl.java:356)
+	at io.grpc.internal.ServerImpl$JumpToApplicationThreadServerStreamListener$1HalfClosed.runInContext(ServerImpl.java:879)
+	at io.grpc.internal.ContextRunnable.run(ContextRunnable.java:37)
+	at io.grpc.internal.SerializingExecutor.run(SerializingExecutor.java:133)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1583)
+
+Nov 14, 2026 9:25:58 PM io.gapi.emulators.netty.HttpHandler$1 onError
+INFO: Exception when handling request: PERMISSION_DENIED: 
+false for 'get' @ L383, false for 'get' @ L555
+Nov 14, 2026 9:25:58 PM io.netty.channel.DefaultChannelPipeline onUnhandledInboundException
 WARNING: An exceptionCaught() event was fired, and it reached at the tail of the pipeline. It usually means the last handler in the pipeline did not handle the exception.
 java.net.SocketException: Connection reset
 	at java.base/sun.nio.ch.SocketChannelImpl.throwConnectionReset(SocketChannelImpl.java:401)
@@ -81,5 +121,142 @@ java.net.SocketException: Connection reset
 	at io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
 	at java.base/java.lang.Thread.run(Thread.java:1583)
 
-Nov 14, 2026 9:07:27 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+Nov 14, 2026 9:26:11 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
 INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:26:11 PM com.google.cloud.datastore.emulator.impl.util.WrappedStreamObserver onError
+WARNING: Operation failed: 
+false for 'list' @ L409, false for 'list' @ L555
+com.google.cloud.datastore.core.exception.DatastoreException: 
+false for 'list' @ L409, false for 'list' @ L555
+	at com.google.cloud.datastore.core.exception.DatastoreException$Builder.build(DatastoreException.java:152)
+	at com.google.cloud.datastore.emulator.impl.rules.DefaultEmulatorRulesAuthorizer.verboseError(DefaultEmulatorRulesAuthorizer.java:349)
+	at com.google.cloud.datastore.emulator.impl.rules.DefaultEmulatorRulesAuthorizer.withVerboseErrors(DefaultEmulatorRulesAuthorizer.java:326)
+	at com.google.cloud.datastore.emulator.impl.rules.DefaultEmulatorRulesAuthorizer.checkQuery(DefaultEmulatorRulesAuthorizer.java:193)
+	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.ruleAuthorizeAndReadEntities(FirestoreEmulatorHelper.java:838)
+	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.snapshotQuery(FirestoreEmulatorHelper.java:696)
+	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.lambda$query$0(FirestoreEmulatorHelper.java:680)
+	at com.google.cloud.datastore.emulator.impl.transactions.EmulatorTransactionManager$ReadOnlyTransaction.fold(EmulatorTransactionManager.java:492)
+	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.query(FirestoreEmulatorHelper.java:678)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1.listDocuments(CloudFirestoreV1.java:377)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1Router.listDocuments(CloudFirestoreV1Router.java:138)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1Router.getOrListDocuments(CloudFirestoreV1Router.java:122)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter$1.lambda$getOrListDocuments$0(FirestoreV1GrpcAdapter.java:108)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter.unary(FirestoreV1GrpcAdapter.java:72)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter$1.getOrListDocuments(FirestoreV1GrpcAdapter.java:108)
+	at com.google.firestore.v1.FirestoreGrpc$MethodHandlers.invoke(FirestoreGrpc.java:1376)
+	at io.grpc.stub.ServerCalls$UnaryServerCallHandler$UnaryServerCallListener.onHalfClose(ServerCalls.java:182)
+	at io.grpc.PartialForwardingServerCallListener.onHalfClose(PartialForwardingServerCallListener.java:35)
+	at io.grpc.ForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:23)
+	at io.grpc.ForwardingServerCallListener$SimpleForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:40)
+	at io.grpc.Contexts$ContextualizedServerCallListener.onHalfClose(Contexts.java:86)
+	at io.grpc.PartialForwardingServerCallListener.onHalfClose(PartialForwardingServerCallListener.java:35)
+	at io.grpc.ForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:23)
+	at io.grpc.ForwardingServerCallListener$SimpleForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:40)
+	at io.grpc.Contexts$ContextualizedServerCallListener.onHalfClose(Contexts.java:86)
+	at io.grpc.internal.ServerCallImpl$ServerStreamListenerImpl.halfClosed(ServerCallImpl.java:356)
+	at io.grpc.internal.ServerImpl$JumpToApplicationThreadServerStreamListener$1HalfClosed.runInContext(ServerImpl.java:879)
+	at io.grpc.internal.ContextRunnable.run(ContextRunnable.java:37)
+	at io.grpc.internal.SerializingExecutor.run(SerializingExecutor.java:133)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1583)
+
+Nov 14, 2026 9:26:11 PM io.gapi.emulators.netty.HttpHandler$1 onError
+INFO: Exception when handling request: PERMISSION_DENIED: 
+false for 'list' @ L409, false for 'list' @ L555
+Nov 14, 2026 9:26:11 PM com.google.cloud.datastore.emulator.impl.util.WrappedStreamObserver onError
+WARNING: Operation failed: 
+false for 'get' @ L383, false for 'get' @ L555
+com.google.cloud.datastore.core.exception.DatastoreException: 
+false for 'get' @ L383, false for 'get' @ L555
+	at com.google.cloud.datastore.core.exception.DatastoreException$Builder.build(DatastoreException.java:152)
+	at com.google.cloud.datastore.emulator.impl.rules.DefaultEmulatorRulesAuthorizer.verboseError(DefaultEmulatorRulesAuthorizer.java:349)
+	at com.google.cloud.datastore.emulator.impl.rules.DefaultEmulatorRulesAuthorizer.withVerboseErrors(DefaultEmulatorRulesAuthorizer.java:326)
+	at com.google.cloud.datastore.emulator.impl.rules.DefaultEmulatorRulesAuthorizer.checkLookup(DefaultEmulatorRulesAuthorizer.java:157)
+	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.snapshotRead(FirestoreEmulatorHelper.java:318)
+	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.lambda$read$0(FirestoreEmulatorHelper.java:265)
+	at com.google.cloud.datastore.emulator.impl.transactions.EmulatorTransactionManager$ReadOnlyTransaction.fold(EmulatorTransactionManager.java:492)
+	at com.google.cloud.datastore.emulator.impl.firestore.FirestoreEmulatorHelper.read(FirestoreEmulatorHelper.java:264)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1.getDocument(CloudFirestoreV1.java:338)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1Router.getDocument(CloudFirestoreV1Router.java:131)
+	at com.google.cloud.datastore.emulator.impl.firestore.CloudFirestoreV1Router.getOrListDocuments(CloudFirestoreV1Router.java:125)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter$1.lambda$getOrListDocuments$0(FirestoreV1GrpcAdapter.java:108)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter.unary(FirestoreV1GrpcAdapter.java:72)
+	at com.google.cloud.datastore.emulator.firestore.v1.FirestoreV1GrpcAdapter$1.getOrListDocuments(FirestoreV1GrpcAdapter.java:108)
+	at com.google.firestore.v1.FirestoreGrpc$MethodHandlers.invoke(FirestoreGrpc.java:1376)
+	at io.grpc.stub.ServerCalls$UnaryServerCallHandler$UnaryServerCallListener.onHalfClose(ServerCalls.java:182)
+	at io.grpc.PartialForwardingServerCallListener.onHalfClose(PartialForwardingServerCallListener.java:35)
+	at io.grpc.ForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:23)
+	at io.grpc.ForwardingServerCallListener$SimpleForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:40)
+	at io.grpc.Contexts$ContextualizedServerCallListener.onHalfClose(Contexts.java:86)
+	at io.grpc.PartialForwardingServerCallListener.onHalfClose(PartialForwardingServerCallListener.java:35)
+	at io.grpc.ForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:23)
+	at io.grpc.ForwardingServerCallListener$SimpleForwardingServerCallListener.onHalfClose(ForwardingServerCallListener.java:40)
+	at io.grpc.Contexts$ContextualizedServerCallListener.onHalfClose(Contexts.java:86)
+	at io.grpc.internal.ServerCallImpl$ServerStreamListenerImpl.halfClosed(ServerCallImpl.java:356)
+	at io.grpc.internal.ServerImpl$JumpToApplicationThreadServerStreamListener$1HalfClosed.runInContext(ServerImpl.java:879)
+	at io.grpc.internal.ContextRunnable.run(ContextRunnable.java:37)
+	at io.grpc.internal.SerializingExecutor.run(SerializingExecutor.java:133)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1583)
+
+Nov 14, 2026 9:26:11 PM io.gapi.emulators.netty.HttpHandler$1 onError
+INFO: Exception when handling request: PERMISSION_DENIED: 
+false for 'get' @ L383, false for 'get' @ L555
+Nov 14, 2026 9:26:11 PM io.netty.channel.DefaultChannelPipeline onUnhandledInboundException
+WARNING: An exceptionCaught() event was fired, and it reached at the tail of the pipeline. It usually means the last handler in the pipeline did not handle the exception.
+java.net.SocketException: Connection reset
+	at java.base/sun.nio.ch.SocketChannelImpl.throwConnectionReset(SocketChannelImpl.java:401)
+	at java.base/sun.nio.ch.SocketChannelImpl.read(SocketChannelImpl.java:434)
+	at io.netty.buffer.PooledByteBuf.setBytes(PooledByteBuf.java:255)
+	at io.netty.buffer.AbstractByteBuf.writeBytes(AbstractByteBuf.java:1132)
+	at io.netty.channel.socket.nio.NioSocketChannel.doReadBytes(NioSocketChannel.java:356)
+	at io.netty.channel.nio.AbstractNioByteChannel$NioByteUnsafe.read(AbstractNioByteChannel.java:156)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKey(NioEventLoop.java:796)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKeysOptimized(NioEventLoop.java:732)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKeys(NioEventLoop.java:658)
+	at io.netty.channel.nio.NioEventLoop.run(NioEventLoop.java:562)
+	at io.netty.util.concurrent.SingleThreadEventExecutor$4.run(SingleThreadEventExecutor.java:998)
+	at io.netty.util.internal.ThreadExecutorMap$2.run(ThreadExecutorMap.java:74)
+	at io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
+	at java.base/java.lang.Thread.run(Thread.java:1583)
+
+Nov 14, 2026 9:26:48 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected HTTP/2 connection.
+Nov 14, 2026 9:27:29 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:30 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:30 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:30 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:40 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:44 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:44 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:49 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:49 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:49 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:49 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:49 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:27:50 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:28:19 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:28:33 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:28:33 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:28:50 PM io.gapi.emulators.netty.HttpVersionRoutingHandler channelRead
+INFO: Detected non-HTTP/2 connection.
+Nov 14, 2026 9:28:50 PM com.google.cloud.datastore.emulator.firestore.webchannel.FirestoreV1WebChannelAdapter$FirestoreWriteHandler onClose
+INFO: channel closed

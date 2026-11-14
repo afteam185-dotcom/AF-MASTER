@@ -106,6 +106,7 @@ const state = {
 };
 
 const unsubscribers = new Map();
+let sharedDataSubscriptionKey = null;
 let announcementExpiryTimer = null;
 let chatExpiryTimer = null;
 let supportReplyTimer = null;
@@ -401,13 +402,14 @@ async function syncAudienceItems(course, collectionName, documents) {
   const operations = [];
   for (const item of documents) {
     const itemData = item.data();
+    const previousKeys = Array.isArray(itemData.audienceKeys) ? itemData.audienceKeys : [];
     for (const audienceKey of audienceKeys) {
       operations.push({
         ref: audienceContentRef(audienceKey, course.id, collectionName, item.id),
         data: { ...itemData, audienceKeys },
       });
     }
-    for (const audienceKey of itemData.audienceKeys || []) {
+    for (const audienceKey of previousKeys) {
       if (!currentKeys.has(audienceKey)) {
         operations.push({
           ref: audienceContentRef(audienceKey, course.id, collectionName, item.id),
@@ -425,7 +427,7 @@ async function migrateCourseAudience(course) {
   const previousAudienceKeys = previousCourse
     ? courseAudienceKeys(previousCourse)
     : Array.isArray(course.audienceKeys) ? course.audienceKeys : audienceKeys;
-  const migrationKey = `${course.id}:${JSON.stringify(audienceKeys)}:${course.title}:${course.description || ""}`;
+  const migrationKey = `${course.id}:${JSON.stringify([audienceKeys, course.grade, course.track])}:${course.title}:${course.description || ""}`;
   if (!audienceKeys.length || audienceMigrations.has(migrationKey) || migratedAudienceCourses.has(migrationKey)) return;
   audienceMigrations.add(migrationKey);
   try {
@@ -471,6 +473,7 @@ function studentCommunityCount() {
 function clearSubscriptions() {
   for (const unsubscribe of unsubscribers.values()) unsubscribe();
   unsubscribers.clear();
+  sharedDataSubscriptionKey = null;
   window.clearTimeout(announcementExpiryTimer);
   window.clearTimeout(chatExpiryTimer);
   window.clearTimeout(supportReplyTimer);
@@ -618,9 +621,8 @@ function listenProfile(uid) {
     state.profile = snapshot.exists() ? snapshot.data() : null;
     if (state.profile && state.device?.status === "active") {
       if (state.profile.isActive) {
-        listenWarnings(uid);
-        listenStudentLoginCode(uid);
-        if (state.nav === "chat" || state.nav === "support") listenChat();
+        if (!unsubscribers.has("warnings")) listenWarnings(uid);
+        if (!unsubscribers.has("student-login-code")) listenStudentLoginCode(uid);
       } else {
         state.warnings = [];
         state.chatMessages = [];
@@ -694,6 +696,11 @@ function listenAnnouncements() {
 }
 
 function listenSharedData() {
+  const subscriptionKey = state.admin
+    ? `admin:${state.user?.uid || ""}`
+    : `student:${state.user?.uid || ""}:${state.profile?.grade || ""}:${state.profile?.track || ""}:${state.profile?.isActive || false}:${state.profile?.whatsappShareCount || 0}`;
+  if (sharedDataSubscriptionKey === subscriptionKey) return;
+  sharedDataSubscriptionKey = subscriptionKey;
   if (!state.admin && (!state.profile || !state.profile.isActive)) {
     state.courses = [];
     state.catalogCount = 0;
@@ -721,7 +728,9 @@ function listenSharedData() {
     state.courses = [];
   } else {
     const updateCourses = (records) => {
-      state.courses = state.admin ? records : records.filter((course) => courseMatchesProfile(course));
+      const sortedRecords = records.slice().sort((a, b) =>
+        (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
+      state.courses = state.admin ? sortedRecords : sortedRecords.filter((course) => courseMatchesProfile(course));
       if (state.admin) {
         state.catalogCount = records.length;
         syncPublicStats();
@@ -737,7 +746,7 @@ function listenSharedData() {
       render();
     };
     if (state.admin) {
-      listen("courses", query(collection(db, "courses"), orderBy("createdAt", "desc")), (snapshot) => {
+      listen("courses", query(collection(db, "courses")), (snapshot) => {
         const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
         records.forEach((course) => migrateCourseAudience(course));
         updateCourses(records);
@@ -745,7 +754,6 @@ function listenSharedData() {
     } else {
       listen("courses-student", query(
         collection(db, "studentCatalog", currentAudienceKey(state.profile), "courses"),
-        orderBy("createdAt", "desc"),
       ), (snapshot) => {
         updateCourses(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
       });
@@ -754,8 +762,9 @@ function listenSharedData() {
   listenAnnouncements();
 
   if (state.admin) {
-    listen("students", query(collection(db, "profiles"), orderBy("createdAt", "desc")), (snapshot) => {
-      state.students = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+    listen("students", query(collection(db, "profiles")), (snapshot) => {
+      state.students = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))
+        .sort((a, b) => (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
       state.studentCount = state.students.length;
       syncPublicStats();
       render();
@@ -956,12 +965,14 @@ function listenChat(preserveMessages = false) {
     });
     return;
   }
-  const items = [[], []];
-  const received = [false, false];
-  const update = () => {
-    if (!received.every(Boolean)) return;
-    updateMessages(items.flat()
-      .filter((message, index, list) => list.findIndex((item) => item.id === message.id) === index));
+  const activeMessagesQuery = query(
+    messages,
+    where("expiresAt", ">", Timestamp.fromDate(new Date(Date.now() + 1000))),
+    orderBy("expiresAt", "asc"),
+    orderBy("createdAt", "asc"),
+  );
+  listen("chat0", activeMessagesQuery, (snapshot) => {
+    updateMessages(snapshot.docs);
     window.clearTimeout(chatExpiryTimer);
     const nextExpiry = state.chatMessages
       .map((message) => message.expiresAt?.toMillis?.() || 0)
@@ -969,30 +980,10 @@ function listenChat(preserveMessages = false) {
       .sort((a, b) => a - b)[0];
     if (nextExpiry) {
       chatExpiryTimer = window.setTimeout(() => {
+        chatExpiryTimer = null;
         if (state.nav === "chat") listenChat(true);
       }, Math.max(0, nextExpiry - Date.now() + 50));
     }
-  };
-  const chatQueries = [
-    query(
-      messages,
-      where("expiresAt", ">", new Date()),
-      orderBy("expiresAt", "asc"),
-      orderBy("createdAt", "asc"),
-    ),
-    query(
-      messages,
-      where("expiresAt", "==", null),
-      orderBy("expiresAt", "asc"),
-      orderBy("createdAt", "asc"),
-    ),
-  ];
-  chatQueries.forEach((chatQuery, index) => {
-    listen(`chat${index}`, chatQuery, (snapshot) => {
-      items[index] = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-      received[index] = true;
-      update();
-    });
   });
 }
 
@@ -1610,6 +1601,10 @@ async function handleSubmit(event) {
         const loginCode = createNumericLoginCode();
         const profileRef = doc(db, "profiles", state.user.uid);
         const batch = writeBatch(db);
+        batch.set(doc(db, "publicStats", "catalog"), {
+          studentCount: increment(1),
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
         batch.set(profileRef, {
           uid: state.user.uid,
           fullName,
@@ -1952,15 +1947,26 @@ async function enableStudentCodeLogin() {
   }
 }
 
-async function deleteCourseAndContent(courseId) {
+async function deleteCourseAndContent(course) {
+  const courseId = course.id;
   const [chapterSnapshot, lessonSnapshot] = await Promise.all([
     getDocs(query(collection(db, "chapters"), where("courseId", "==", courseId))),
     getDocs(query(collection(db, "lessons"), where("courseId", "==", courseId))),
   ]);
   const contentRefs = [
+    doc(db, "courses", courseId),
     ...chapterSnapshot.docs.map((item) => item.ref),
     ...lessonSnapshot.docs.map((item) => item.ref),
   ];
+  for (const audienceKey of courseAudienceKeys(course)) {
+    contentRefs.push(audienceCourseRef(audienceKey, courseId));
+    for (const chapter of chapterSnapshot.docs) {
+      contentRefs.push(audienceContentRef(audienceKey, courseId, "chapters", chapter.id));
+    }
+    for (const lesson of lessonSnapshot.docs) {
+      contentRefs.push(audienceContentRef(audienceKey, courseId, "lessons", lesson.id));
+    }
+  }
   for (let offset = 0; offset < contentRefs.length; offset += 450) {
     const batch = writeBatch(db);
     for (const contentRef of contentRefs.slice(offset, offset + 450)) {
@@ -1968,7 +1974,18 @@ async function deleteCourseAndContent(courseId) {
     }
     await batch.commit();
   }
-  await deleteDoc(doc(db, "courses", courseId));
+}
+
+async function deleteLessonAndAudienceCopies(lessonId) {
+  const lesson = state.lessons.find((item) => item.id === lessonId);
+  if (!lesson) throw new Error("تعذر العثور على الدرس المطلوب حذفه.");
+  const audienceKeys = courseAudienceKeys(state.selectedCourse || lesson);
+  const batch = writeBatch(db);
+  batch.delete(doc(db, "lessons", lessonId));
+  for (const audienceKey of audienceKeys) {
+    batch.delete(audienceContentRef(audienceKey, lesson.courseId, "lessons", lessonId));
+  }
+  await batch.commit();
 }
 
 async function clickAction(action, target, originalTarget) {
@@ -2042,7 +2059,7 @@ async function clickAction(action, target, originalTarget) {
       state.error = "";
       render();
       try {
-        await deleteCourseAndContent(course.id);
+        await deleteCourseAndContent(course);
         state.selectedCourse = null;
         state.selectedChapterId = "";
         state.selectedLesson = null;
@@ -2074,7 +2091,7 @@ async function clickAction(action, target, originalTarget) {
       if (!state.admin || !target.dataset.lesson) break;
       if (!window.confirm("هل تريد حذف هذا الدرس؟")) break;
       try {
-        await deleteDoc(doc(db, "lessons", target.dataset.lesson));
+        await deleteLessonAndAudienceCopies(target.dataset.lesson);
         notify("تم حذف الدرس.");
       } catch (error) { fail(error); }
       break;
