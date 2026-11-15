@@ -82,6 +82,7 @@ const state = {
   nav: "home",
   navHistory: [],
   courses: [],
+  groupChatLocked: false,
   catalogCount: 0,
   studentCount: 0,
   chapters: [],
@@ -894,6 +895,17 @@ function listenChat(preserveMessages = false) {
     unsubscribers.get(key)?.();
     unsubscribers.delete(key);
   }
+  if (state.nav === "chat") {
+    if (!unsubscribers.has("group-chat-settings")) {
+      listen("group-chat-settings", doc(db, "chatSettings", "group"), (snapshot) => {
+        state.groupChatLocked = snapshot.exists() && snapshot.data().locked === true;
+        render();
+      });
+    }
+  } else {
+    unsubscribers.get("group-chat-settings")?.();
+    unsubscribers.delete("group-chat-settings");
+  }
   window.clearTimeout(chatExpiryTimer);
   chatExpiryTimer = null;
   window.clearTimeout(supportReplyTimer);
@@ -1008,6 +1020,9 @@ async function writeChatMessage(value) {
 
   const support = state.nav === "support";
   const isAdminSender = state.admin;
+  if (!support && !isAdminSender && state.groupChatLocked) {
+    throw new Error("الشات الجماعي مغلق حالياً للطلاب. يمكنك قراءة الرسائل فقط.");
+  }
   const recipientUid = support
     ? (isAdminSender ? state.supportTarget : state.user.uid)
     : "";
@@ -1103,6 +1118,7 @@ onAuthStateChanged(auth, async (user) => {
   clearSubscriptions();
   state.user = user;
   state.profile = null;
+  state.groupChatLocked = false;
   state.studentLoginCode = null;
   window.clearTimeout(whatsappChannelTimer);
   whatsappChannelTimer = null;
@@ -1406,9 +1422,10 @@ function chatView(support) {
     ? state.students.find((student) => student.id === state.supportTarget)?.fullName || "محادثة الطالب"
     : "تواصل مع المشرف") : "شات الطلاب";
   const ended = support && !state.admin && supportReplyExpired(state.supportRoom);
-  const canSend = !support || (state.admin
+  const canSend = support ? (state.admin
     ? Boolean(state.supportRoom)
-    : state.supportRoom ? (!ended || state.supportDraftOpen) : state.supportDraftOpen);
+    : state.supportRoom ? (!ended || state.supportDraftOpen) : state.supportDraftOpen)
+    : state.admin || !state.groupChatLocked;
   const supportNotice = !support ? "" : !state.supportRoom && !state.admin
     ? `<div class="support-ended"><b>تواصل مع المشرف</b><span>ابدأ دردشة خاصة، وسيصلك الرد هنا مع الاحتفاظ بسجل المحادثة.</span><button class="button button-primary" data-action="start-support-chat">بدء دردشة جديدة</button></div>`
     : !state.supportRoom ? "" : state.admin
@@ -1420,12 +1437,19 @@ function chatView(support) {
         : `<div class="support-status">رد المشرف بانتظارك. يمكنك الرد خلال 24 ساعة للمتابعة.</div>`;
   const backButton = support && state.admin
     ? `<button class="button button-outline" data-action="back-support-inbox">← صندوق الوارد</button>` : "";
+  const groupChatStatus = support ? "" : state.groupChatLocked
+    ? `<div class="support-status">${state.admin ? "الشات مغلق أمام الطلاب؛ يمكنك إرسال الرسائل." : "الشات مغلق حالياً. يمكنك قراءة الرسائل، والكتابة متاحة للمشرف فقط."}</div>`
+    : "";
+  const groupChatToggle = !support && state.admin
+    ? `<button class="button button-outline" data-action="toggle-group-chat">${state.groupChatLocked ? "فتح الشات للطلاب" : "إغلاق الشات للطلاب"}</button>`
+    : "";
   const description = support
     ? (state.admin ? "محادثة خاصة دائمة بينك وبين الطالب." : "محادثتك خاصة ومحفوظة كسجل دائم بينك وبين المشرف.")
     : "تواصل مع زملائك في مساحة واحدة. تُحذف رسائل الشات العام بعد 24 ساعة.";
-  return `<section class="chat-page ${support ? "support-chat" : "student-chat"}"><div class="page-title-row"><div><span class="eyebrow">مساحة التواصل</span><h1>${h(title)}</h1><p>${description}</p></div><div class="chat-page-actions">${backButton}<span class="privacy-badge">♢ ${support ? "سجل خاص محفوظ" : "رسائل مؤقتة"}</span></div></div>
+  return `<section class="chat-page ${support ? "support-chat" : "student-chat"}"><div class="page-title-row"><div><span class="eyebrow">مساحة التواصل</span><h1>${h(title)}</h1><p>${description}</p></div><div class="chat-page-actions">${backButton}${groupChatToggle}<span class="privacy-badge">♢ ${support ? "سجل خاص محفوظ" : state.groupChatLocked ? "المشرف فقط يكتب" : "رسائل مؤقتة"}</span></div></div>
     <div class="chat-card"><div class="chat-head"><div class="chat-head-icon">◌</div><div><b>${h(title)}</b><small>${support ? "سجل المحادثة محفوظ للطرفين" : "تُحذف رسائل الشات العام بعد 24 ساعة"}</small></div><span class="online-dot"></span></div>
     ${supportNotice}
+    ${groupChatStatus}
     <div class="chat-stream" aria-label="رسائل المحادثة">${state.chatMessages.length ? state.chatMessages.map((message) => {
       const messageClass = message.kind === "system"
         ? "system-message"
@@ -1434,7 +1458,7 @@ function chatView(support) {
           : "peer chat-message-other";
       return `<div class="chat-message ${messageClass}" data-chat-message="${h(message.id)}"><div class="message-meta"><b>${h(message.senderName)}</b><small>${h(timestampText(message.createdAt, true))}</small></div><p>${h(message.text)}</p>${state.admin && !support && message.kind !== "system" ? `<button class="message-delete" data-delete-message="${h(message.id)}">×</button>` : ""}</div>`;
     }).join("") : emptyState("◌", "ابدأ المحادثة", "اكتب أول رسالة وابدأ التواصل.")}</div>
-    <form class="chat-composer" data-form="chat"><input name="text" value="${h(state.chatText)}" placeholder="${ended && state.supportDraftOpen ? "اكتب رسالتك لبدء دردشة جديدة..." : "اكتب رسالتك هنا..."}" maxlength="2000" ${!canSend ? "disabled" : ""}><button class="send-button" ${state.busy || !canSend ? "disabled" : ""} aria-label="إرسال الرسالة">➤</button></form></div></section>`;
+    <form class="chat-composer" data-form="chat"><input name="text" value="${h(state.chatText)}" placeholder="${!support && state.groupChatLocked && !state.admin ? "الشات مغلق — المشرف فقط يمكنه الكتابة" : ended && state.supportDraftOpen ? "اكتب رسالتك لبدء دردشة جديدة..." : "اكتب رسالتك هنا..."}" maxlength="2000" ${!canSend ? "disabled" : ""}><button class="send-button" ${state.busy || !canSend ? "disabled" : ""} aria-label="إرسال الرسالة">➤</button></form></div></section>`;
 }
 
 function supportInboxView() {
@@ -2071,6 +2095,27 @@ async function clickAction(action, target, originalTarget) {
       } catch (error) { fail(error); }
       break;
     }
+    case "toggle-group-chat": {
+      if (!state.admin || state.busy) break;
+      const locked = !state.groupChatLocked;
+      state.busy = true;
+      render();
+      try {
+        await setDoc(doc(db, "chatSettings", "group"), {
+          locked,
+          updatedAt: serverTimestamp(),
+          updatedBy: state.user.uid,
+        }, { merge: true });
+        state.groupChatLocked = locked;
+        notify(locked ? "تم إغلاق الشات للطلاب. يمكنك وحدك الكتابة." : "تم فتح الشات للطلاب.");
+      } catch (error) {
+        fail(error);
+      } finally {
+        state.busy = false;
+        render();
+      }
+      break;
+    }
     case "start-support-chat":
       if (state.admin || state.nav !== "support" || !state.profile?.isActive) break;
       state.supportDraftOpen = true;
@@ -2285,7 +2330,7 @@ function navigateTo(nav, remember = true, clearSupportTarget = true) {
   if (state.nav === "learning") listenLessons(state.selectedCourse);
   if (state.nav === "chat" || state.nav === "support") listenChat();
   else {
-    for (const key of ["chat0", "chat1", "support-room", "support-inbox"]) {
+    for (const key of ["chat0", "chat1", "support-room", "support-inbox", "group-chat-settings"]) {
       unsubscribers.get(key)?.();
       unsubscribers.delete(key);
     }

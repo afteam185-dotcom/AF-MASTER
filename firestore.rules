@@ -97,6 +97,10 @@ service cloud.firestore {
         && value > request.time
         && value <= request.time + duration.value(25, 'h');
     }
+    function groupChatOpen() {
+      let settingsPath = /databases/$(database)/documents/chatSettings/group;
+      return !exists(settingsPath) || get(settingsPath).data.get('locked', false) != true;
+    }
     function validChatMessageFields() {
       return request.resource.data.keys().hasAll([
           'senderId', 'senderName', 'text', 'kind', 'createdAt', 'expiresAt'
@@ -159,6 +163,7 @@ service cloud.firestore {
             && (
               (
                 roomId == 'students'
+                && groupChatOpen()
                 && validMessageExpiry(request.resource.data.expiresAt)
               )
               || (
@@ -467,6 +472,29 @@ service cloud.firestore {
           && (isAdmin() || (roomId == 'support_' + request.auth.uid && hasActiveProfile()));
         allow delete: if isAdmin() && roomId == 'students';
       }
+    }
+
+    match /chatSettings/{settingId} {
+      allow get: if settingId == 'group' && (isAdmin() || hasActiveProfile());
+      allow list: if false;
+      allow create: if isAdmin()
+        && settingId == 'group'
+        && request.resource.data.keys().hasOnly(['locked', 'updatedAt', 'updatedBy'])
+        && request.resource.data.keys().hasAll(['locked', 'updatedAt', 'updatedBy'])
+        && request.resource.data.locked is bool
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.updatedBy == request.auth.uid;
+      allow update: if isAdmin()
+        && settingId == 'group'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'locked', 'updatedAt', 'updatedBy'
+        ])
+        && request.resource.data.keys().hasOnly(['locked', 'updatedAt', 'updatedBy'])
+        && request.resource.data.keys().hasAll(['locked', 'updatedAt', 'updatedBy'])
+        && request.resource.data.locked is bool
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.updatedBy == request.auth.uid;
+      allow delete: if false;
     }
 
     match /announcements/{announcementId} {
