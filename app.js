@@ -109,6 +109,9 @@ const state = {
   editingChapterId: null,
   editingLessonId: null,
   chatText: "",
+  whatsappSharePending: false,
+  whatsappShareReturned: false,
+  whatsappShareLeftApp: false,
 };
 
 const unsubscribers = new Map();
@@ -314,6 +317,13 @@ function timestampText(value, includeTime = false) {
 
 function remainingReferrals() {
   return Math.max(10 - Number(state.profile?.whatsappShareCount || 0), 0);
+}
+
+function clearPendingWhatsAppShare() {
+  state.whatsappShareDraft = null;
+  state.whatsappSharePending = false;
+  state.whatsappShareReturned = false;
+  state.whatsappShareLeftApp = false;
 }
 
 function normalizeCourseFilterValues(value) {
@@ -657,6 +667,7 @@ function listenProfile(uid) {
         state.studentLoginCode = null;
         state.whatsappChannelOpened = false;
         state.whatsappChannelReady = false;
+        clearPendingWhatsAppShare();
         unsubscribers.get("warnings")?.();
         unsubscribers.delete("warnings");
         unsubscribers.get("student-login-code")?.();
@@ -749,35 +760,44 @@ function listenSharedData() {
       unsubscribers.delete(key);
     }
   }
-  const updateCourses = (records) => {
-    const sortedRecords = records.slice().sort((a, b) =>
-      (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
-    state.courses = state.admin ? sortedRecords : sortedRecords.filter((course) => courseMatchesProfile(course));
-    if (state.admin) {
-      state.catalogCount = records.length;
-      syncPublicStats();
-    }
-    if (state.selectedCourse) {
-      state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
-      if (!state.selectedCourse) {
-        state.selectedChapterId = "";
-        state.selectedLesson = null;
-        listenLessons(null);
-      }
-    }
-    render();
-  };
-  if (state.admin) {
-    listen("courses", query(collection(db, "courses")), (snapshot) => {
-      const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-      records.forEach((course) => migrateCourseAudience(course));
-      updateCourses(records);
-    });
+  const canReadCourses = state.admin || Number(state.profile.whatsappShareCount || 0) >= 10;
+  if (!canReadCourses) {
+    state.courses = [];
+    state.selectedCourse = null;
+    state.selectedChapterId = "";
+    state.selectedLesson = null;
+    listenLessons(null);
   } else {
-    const audienceKey = currentAudienceKey(state.profile);
-    listen("courses-student", collection(db, "studentCatalog", audienceKey, "courses"), (snapshot) => {
-      updateCourses(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-    });
+    const updateCourses = (records) => {
+      const sortedRecords = records.slice().sort((a, b) =>
+        (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
+      state.courses = state.admin ? sortedRecords : sortedRecords.filter((course) => courseMatchesProfile(course));
+      if (state.admin) {
+        state.catalogCount = records.length;
+        syncPublicStats();
+      }
+      if (state.selectedCourse) {
+        state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
+        if (!state.selectedCourse) {
+          state.selectedChapterId = "";
+          state.selectedLesson = null;
+          listenLessons(null);
+        }
+      }
+      render();
+    };
+    if (state.admin) {
+      listen("courses", query(collection(db, "courses")), (snapshot) => {
+        const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+        records.forEach((course) => migrateCourseAudience(course));
+        updateCourses(records);
+      });
+    } else {
+      const audienceKey = currentAudienceKey(state.profile);
+      listen("courses-student", collection(db, "studentCatalog", audienceKey, "courses"), (snapshot) => {
+        updateCourses(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      });
+    }
   }
   listenAnnouncements();
 
@@ -815,6 +835,9 @@ async function markAnnouncementsSeen() {
 }
 
 function listenLessons(course) {
+  if (!state.admin && Number(state.profile?.whatsappShareCount || 0) < 10) {
+    course = null;
+  }
   if (!course) {
     state.chapters = [];
     state.lessons = [];
@@ -1093,7 +1116,6 @@ function startStudentSession(user, profile) {
   state.profile = profile;
   state.device = { status: "active" };
   state.deviceError = "";
-  maybeShowShareReturnConfirmation();
   listenProfile(user.uid);
   listenSharedData();
 }
@@ -1107,6 +1129,7 @@ onAuthStateChanged(auth, async (user) => {
   whatsappChannelTimer = null;
   state.whatsappChannelOpened = false;
   state.whatsappChannelReady = false;
+  clearPendingWhatsAppShare();
   state.device = null;
   state.deviceError = "";
   state.admin = false;
@@ -1300,24 +1323,26 @@ function emptyState(icon, title, body, action = "") {
 
 function progressBlock() {
   const shares = Math.min(Number(state.profile?.whatsappShareCount || 0), 10);
-  return `<div class="referral-progress"><div class="progress-label"><span>أرقام واتساب المختلفة</span><b>${shares} <small>/ 10</small></b></div><div class="progress-track"><span style="width:${shares * 10}%"></span></div></div>`;
+  return `<div class="referral-progress"><div class="progress-label"><span>دعوات واتساب المؤكدة</span><b>${shares} <small>/ 10</small></b></div><div class="progress-track"><span style="width:${shares * 10}%"></span></div></div>`;
 }
 
 function dashboardView() {
   const firstName = displayName().split(" ")[0];
   const preview = state.courses.slice(0, 2);
-  const courseCountValue = state.admin ? (state.courses.length || 0) : learnCatalogCount();
+  const courseCountValue = state.admin
+    ? (state.courses.length || 0)
+    : remainingReferrals() ? 0 : learnCatalogCount();
   const studentCrowdValue = studentCommunityCount();
   return `<div class="dashboard-page"><div class="welcome-banner"><div class="welcome-content"><span class="eyebrow"><span class="online-dot"></span> منصتك التعليمية في مكان واحد</span>
     <h1>${state.admin ? "أهلاً بك في لوحة الإشراف" : `أهلاً يا ${h(firstName)}،<br>جاهز لخطوتك الجاية؟`}</h1>
     <p>${state.admin ? "أدر المحتوى وتابع الطلاب من مكان واحد." : "اختار درس النهاردة وخلي هدفك أقرب."}</p>
     ${state.admin ? "" : `<button class="button button-light" data-nav="learning">ابدأ التعلّم ←</button>`}</div>
     <div class="welcome-art" aria-hidden="true"><div class="art-ring ring-a"></div><div class="art-ring ring-b"></div><div class="art-book">▤</div><div class="art-star star-a">✦</div><div class="art-star star-b">✧</div><div class="art-dot"></div></div><div class="banner-grain"></div></div>
-    <div class="stat-grid">${statCard("▤", "المنصات المتاحة", String(courseCountValue).padStart(2, "0"), state.admin ? "في مكتبة المحتوى" : "متاحة للطلاب", "cyan")}${statCard("▧", "إعلانات جديدة", String(state.announcements.length).padStart(2, "0"), "من فريق الإشراف", "purple")}${statCard("◌", state.admin ? "أجهزة المشرف النشطة" : "طلابنا", state.admin ? String(state.adminDeviceCount) : String(studentCrowdValue), state.admin ? "بلا حد أقصى" : "3× العدد الحقيقي", "blue")}</div>
+    <div class="stat-grid">${statCard("▤", "المنصات المتاحة", String(courseCountValue).padStart(2, "0"), state.admin ? "في مكتبة المحتوى" : "متاحة للطلاب", "cyan")}${statCard("▧", "إعلانات جديدة", String(state.announcements.length).padStart(2, "0"), "من فريق الإشراف", "purple")}${statCard("◌", state.admin ? "أجهزة المشرف النشطة" : "طلابنا", state.admin ? String(state.adminDeviceCount) : String(studentCrowdValue), state.admin ? "بلا حد أقصى" : "من مجتمع AF MASTER", "blue")}</div>
     ${state.admin ? "" : `${state.warnings.length ? `<section class="panel warning-panel"><div class="panel-heading"><div><span class="eyebrow">تنبيه من الإشراف</span><h2>ملاحظات على حسابك</h2></div></div>${state.warnings.map((warning) => `<article class="warning-row"><b>${h(warning.body)}</b><small>${h(timestampText(warning.createdAt, true))}</small></article>`).join("")}</section>` : ""}
     <div class="dashboard-columns"><section class="panel learning-panel"><div class="panel-heading"><div><span class="eyebrow">مساحة التعلّم</span><h2>منصاتك الدراسية</h2></div><button class="text-button" data-nav="learning">عرض الكل ←</button></div>
     ${preview.length ? `<div class="course-mini-grid">${preview.map(courseCard).join("")}</div>` : emptyState("▤", "لسه مفيش منصات", "سيظهر محتوى صفك هنا بمجرد إضافته من المشرف.")}</section>
-    <section class="panel referral-panel"><div class="referral-top"><div class="referral-icon">♧</div><span class="pill">شارك عبر واتساب</span></div><h2>ساعد أصحابك يعرفوا المنصة</h2><p>أضف 10 أرقام مختلفة. مش مطلوب من أصحابك يسجلوا أو يعملوا حساب.</p>${progressBlock()}<button class="button button-outline button-wide" data-action="share" ${remainingReferrals() ? "" : "disabled"}>${remainingReferrals() ? "أضف رقم صديق" : "اكتمل المطلوب ✓"}</button><small class="referral-hint">يُحتسب كل رقم صحيح مرة واحدة لحسابك. إرسال الرسالة على واتساب متاح لكنه غير مطلوب.</small></section></div>`}
+    <section class="panel referral-panel"><div class="referral-top"><div class="referral-icon">♧</div><span class="pill">شارك عبر واتساب</span></div><h2>ساعد أصحابك يعرفوا المنصة</h2><p>أرسل دعوة واتساب جاهزة إلى 10 أصدقاء مختلفين، ثم أكّد الإرسال عند عودتك.</p>${progressBlock()}<button class="button button-outline button-wide" data-action="share" ${remainingReferrals() ? "" : "disabled"}>${remainingReferrals() ? "أرسل دعوة لصديق" : "اكتمل المطلوب ✓"}</button><small class="referral-hint">يُحتسب كل رقم مختلف بعد إرسال الدعوة والضغط على زر التأكيد.</small></section></div>`}
     ${state.announcements.length ? `<section class="panel announcement-preview"><div class="panel-heading"><div><span class="eyebrow">آخر التحديثات</span><h2>رسائل المشرف</h2></div><span class="pill">${state.announcements.length} جديد</span></div><div class="announcement-list">${state.announcements.slice(0, 2).map((announcement) => `<article class="announcement-row"><span class="announcement-symbol">▧</span><div><b>${h(announcement.title)}</b><p>${h(announcement.body)}</p></div><span class="read-check">✓✓</span></article>`).join("")}</div></section>` : ""}
     ${state.installPrompt ? `<div class="install-banner"><span>▣</span><div><b>خلّي AF MASTER أقرب ليك</b><span>ثبّت المنصة على جهازك وافتحها بسهولة.</span></div><button class="button button-light" data-action="install">تثبيت ←</button></div>` : ""}${state.installed ? `<div class="installed-note">✓ تم تثبيت AF MASTER على جهازك.</div>` : ""}
   </div>`;
@@ -1362,6 +1387,10 @@ function chapterGroups() {
 }
 
 function learningView() {
+  if (!state.admin && Number(state.profile?.whatsappShareCount || 0) < 10) {
+    return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>افتح منصات التعلّم</h1><p>أرسل دعوات واتساب إلى 10 أصدقاء مختلفين، ثم أكّد الإرسال عند عودتك للمنصة.</p></div></div>
+      <section class="unlock-card"><div class="unlock-art">♧</div><span class="eyebrow">دعوة جاهزة عبر واتساب</span><h2>باقي لك ${remainingReferrals()} دعوات</h2><p>أدخل رقم صديق، أرسل له الرسالة الجاهزة عبر واتساب، ثم ارجع واضغط زر التأكيد ليُحتسب الإرسال.</p>${progressBlock()}<button class="button button-primary" data-action="share">أرسل دعوة واتساب</button></section></div>`;
+  }
   if (state.selectedLesson) return lessonView();
   if (state.selectedCourse) {
     const groups = chapterGroups();
@@ -1463,16 +1492,6 @@ function adminView() {
     <div class="student-table-wrap"><table class="student-table"><thead><tr><th>الطالب والبريد</th><th>كود الدعوة</th><th>الهاتف</th><th>الصف / المسار</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>${students.map((student) => `<tr><td><div class="student-name"><span class="avatar tiny">${h(student.fullName?.slice(0, 1))}</span><span class="student-identity"><b>${h(student.fullName)}</b><small>${h(student.email)}</small></span></div></td><td><span class="code">${h(student.studentCode || "—")}</span></td><td dir="ltr">${h(student.phone)}</td><td>${h(student.grade)} · ${h(student.track)}</td><td><span class="status-pill ${student.isActive ? "status-active" : "status-banned"}">${student.isActive ? "نشط" : "محظور"}</span></td><td><div class="table-actions"><button title="تحذير" data-warning="${h(student.id)}">▧</button>${student.isActive ? `<button class="danger-icon" title="حظر" data-ban="${h(student.id)}">♢</button>` : ""}</div></td></tr>`).join("")}</tbody></table>${students.length ? "" : emptyState("♧", "لا توجد حسابات", "ستظهر الحسابات المسجلة هنا.")}</div></section></div>`;
 }
 
-function maybeShowShareReturnConfirmation() {
-  const params = new URLSearchParams(location.search);
-  if (params.get("wa") !== "1" || !state.user || !state.profile?.isActive) return;
-  state.modal = "whatsapp-share-added";
-  state.notice = "تم إرسال الدعوة عبر واتساب بنجاح. وبمجرد الرجوع للمنصة سيتم تأكيدها تلقائياً.";
-  state.whatsappShareDraft = {
-    url: `https://wa.me/?text=${encodeURIComponent(`انضم إلى AF MASTER وابدأ التعلم معي! ${location.origin}${location.pathname}?ref=${state.profile?.studentCode || ""}`)}`,
-  };
-}
-
 function modalView() {
   if (!state.admin && state.profile?.isActive && !state.profile.whatsappChannelJoined) {
     return `<div class="modal-backdrop"><section class="modal-card channel-modal" role="dialog" aria-modal="true" aria-labelledby="channel-modal-title">
@@ -1494,11 +1513,10 @@ function modalView() {
     return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>كود دخولك الرقمي</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${activeCode && /^\d{8}$/.test(state.studentLoginCode) ? "احتفظ بهذا الكود بسرية؛ يمكن استخدامه وحده للدخول إلى حسابك." : "حدّث الكود إلى 8 أرقام لتسجيل الدخول به. استخدم Google إلى أن يكتمل التحديث."}</p><div class="profile-details"><div><span>كود الطالب — ${state.studentLoginCode.length} أرقام</span><b class="code" dir="ltr">${h(state.studentLoginCode)}</b></div></div><div class="form-grid"><button type="button" class="button button-outline" data-copy="${h(state.studentLoginCode)}">نسخ الكود</button>${activeCode && /^\d{8}$/.test(state.studentLoginCode) ? "" : `<button class="button button-primary" data-action="enable-code-login" ${state.busy ? "disabled" : ""}>${state.studentLoginCode.length === 24 ? "تحديث الكود إلى 8 أرقام" : "تفعيل كود الدخول"}</button>`}</div>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}</section></div>`;
   }
   if (state.modal === "whatsapp-share") {
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>أضف رقم صديق</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">أدخل رقم واتساب بصيغة صحيحة ومختلفاً. يُحتسب الرقم فور إضافته؛ إرسال الرسالة أو تسجيل الصديق غير مطلوب.</p><form class="form-grid" data-form="whatsapp-share"><label>رقم واتساب مع مفتاح الدولة<input name="phone" type="tel" inputmode="tel" autocomplete="tel" required placeholder="+20 10 1234 5678 أو 01012345678"></label><small class="referral-hint">نتحقق من صيغة الرقم وتكراره في حسابك فقط، ولا نستطيع تأكيد أنه رقم فعّال دون تحقق خارجي.</small>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}<button class="button button-primary" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ حفظ الرقم..." : "إضافة الرقم ←"}</button></form></section></div>`;
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>أرسل دعوة لصديق</h2><button class="icon-button" data-action="close-modal" ${state.busy ? "disabled" : ""}>×</button></div><p class="muted">أدخل رقم واتساب مختلفاً؛ ستفتح رسالة جاهزة لإرسالها. بعد الإرسال ارجع للمنصة واضغط تأكيد الإرسال.</p><form class="form-grid" data-form="whatsapp-share"><label>رقم واتساب مع مفتاح الدولة<input name="phone" type="tel" inputmode="tel" autocomplete="tel" required placeholder="+20 10 1234 5678 أو 01012345678"></label><small class="referral-hint">لا يُحتسب الرقم إلا بعد العودة من واتساب وتأكيد إرسال الدعوة.</small>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}<button class="button button-primary" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ فتح واتساب..." : "افتح واتساب وأرسل الدعوة ←"}</button></form></section></div>`;
   }
   if (state.modal === "whatsapp-share-added" && state.whatsappShareDraft) {
-    const finished = remainingReferrals() === 0;
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${finished ? "اكتمل العدد المطلوب!" : "تمت إضافة الرقم"}</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${finished ? "اكتملت الأرقام العشرة، وفتحت لك منصات التعلّم." : `تم تسجيل رقم مختلف. باقي ${remainingReferrals()} أرقام.`} ${finished ? "" : "لا يلزم أن يسجل أصحابك في المنصة."}</p><div class="form-grid"><a class="button button-outline button-wide" href="${h(state.whatsappShareDraft.url)}" target="_blank" rel="noopener noreferrer">إرسال الدعوة عبر واتساب (اختياري)</a><button class="button button-primary button-wide" data-action="change-whatsapp-number" ${finished ? "disabled" : ""}>${finished ? "تم — ابدأ التعلّم" : "إضافة رقم آخر"}</button></div></section></div>`;
+    return `<div class="modal-backdrop"><section class="modal-card"><div class="modal-heading"><h2>${state.whatsappShareReturned ? "تأكيد إرسال الدعوة" : "أرسل الدعوة عبر واتساب"}</h2></div><p class="muted">${state.whatsappShareReturned ? `هل أرسلت الدعوة إلى الرقم الذي ينتهي بـ ${h(state.whatsappShareDraft.phone.slice(-4))}؟` : "أرسل الرسالة الجاهزة في واتساب ثم ارجع إلى المنصة؛ سيظهر زر التأكيد بعد عودتك."}</p>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}<div class="form-grid">${state.whatsappShareReturned ? `<button class="button button-primary button-wide" data-action="confirm-whatsapp-share" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ التأكيد..." : "تم الإرسال — تأكيد"}</button>` : `<span class="muted">بانتظار العودة من واتساب...</span>`}<button class="button button-outline button-wide" data-action="cancel-whatsapp-share" ${state.busy ? "disabled" : ""}>إلغاء</button></div></section></div>`;
   }
   if (state.modal === "profile") {
     const loginCode = state.studentLoginCode || linkedLoginCode(state.user);
@@ -1564,6 +1582,7 @@ async function handleSubmit(event) {
   state.busy = true;
   state.error = "";
   render();
+  let whatsappWindow = null;
   try {
     switch (form.dataset.form) {
       case "code-login": {
@@ -1683,6 +1702,17 @@ async function handleSubmit(event) {
         if (state.profile?.phone && normalizeWhatsAppNumber(state.profile.phone) === phone) {
           throw new Error("اكتب رقم شخص آخر، وليس رقمك.");
         }
+        if (Number(state.profile?.whatsappShareCount || 0) >= 10) {
+          throw new Error("اكتمل العدد المطلوب بالفعل.");
+        }
+        state.whatsappSharePending = true;
+        state.whatsappShareReturned = false;
+        state.whatsappShareLeftApp = false;
+        whatsappWindow = window.open("about:blank", "_blank");
+        if (!whatsappWindow) {
+          throw new Error("تعذر فتح واتساب. اسمح بالنوافذ المنبثقة ثم حاول مرة أخرى.");
+        }
+        whatsappWindow.opener = null;
         const recipientHash = await hashWhatsAppNumber(phone);
         const profileRef = doc(db, "profiles", state.user.uid);
         const shareRef = doc(db, "profiles", state.user.uid, "whatsappShares", recipientHash);
@@ -1694,35 +1724,13 @@ async function handleSubmit(event) {
         if (existingShare.exists()) throw new Error("تمت إضافة هذا الرقم من قبل. أدخل رقماً مختلفاً.");
         const currentCount = Number(profileSnapshot.data().whatsappShareCount || 0);
         if (currentCount >= 10) throw new Error("اكتمل العدد المطلوب بالفعل.");
-        const text = `انضم إلى AF MASTER وابدأ التعلم معي! ${location.origin}${location.pathname}?ref=${state.profile?.studentCode || ""}&wa=1`;
+        const text = `انضم إلى AF MASTER وابدأ التعلم معي! ${location.origin}${location.pathname}?ref=${state.profile?.studentCode || ""}`;
         const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(text)}`;
-        const batch = writeBatch(db);
-        batch.update(profileRef, {
-          whatsappShareCount: increment(1),
-          lastWhatsAppShareId: recipientHash,
-        });
-        batch.set(shareRef, {
-          recipientHash,
-          createdAt: serverTimestamp(),
-        });
-        await batch.commit();
-        const nextCount = currentCount + 1;
-        state.profile = {
-          ...profileSnapshot.data(),
-          whatsappShareCount: nextCount,
-          lastWhatsAppShareId: recipientHash,
-        };
-        state.whatsappShareDraft = { url: waUrl };
+        state.whatsappShareDraft = { url: waUrl, recipientHash, phone };
+        whatsappWindow.location.href = waUrl;
+        whatsappWindow = null;
         state.modal = "whatsapp-share-added";
         state.error = "";
-        listenSharedData();
-        const shareWindow = window.open(waUrl, "_blank", "noopener,noreferrer");
-        if (!shareWindow) {
-          state.notice = "تم حفظ الرقم بنجاح. تستطيع إرسال الدعوة يدوياً عبر الزر في الشاشة التالية.";
-        }
-        notify(nextCount >= 10
-          ? "اكتمل العدد! منصات التعلّم أصبحت متاحة."
-          : `تمت إضافة الرقم. باقي ${10 - nextCount} أرقام مختلفة.`);
         break;
       }
       case "chat":
@@ -1885,6 +1893,10 @@ async function handleSubmit(event) {
         break;
     }
   } catch (error) {
+    whatsappWindow?.close();
+    if (form.dataset.form === "whatsapp-share") {
+      clearPendingWhatsAppShare();
+    }
     console.error(`AF MASTER form submission failed (${form.dataset.form}).`, error);
     state.error = form.dataset.form === "code-login"
       && ["auth/invalid-credential", "auth/user-not-found", "auth/wrong-password", "auth/invalid-email"].includes(error?.code)
@@ -2163,7 +2175,7 @@ async function clickAction(action, target, originalTarget) {
     }
     case "close-modal":
       state.modal = "";
-      state.whatsappShareDraft = null;
+      clearPendingWhatsAppShare();
       state.editingCourseId = null;
       state.editingChapterId = null;
       state.editingLessonId = null;
@@ -2173,7 +2185,7 @@ async function clickAction(action, target, originalTarget) {
     case "backdrop":
       if (originalTarget === target) {
         state.modal = "";
-        state.whatsappShareDraft = null;
+        clearPendingWhatsAppShare();
         state.editingCourseId = null;
         state.editingChapterId = null;
         state.editingLessonId = null;
@@ -2183,6 +2195,60 @@ async function clickAction(action, target, originalTarget) {
       break;
     case "share":
       if (remainingReferrals() === 0) return;
+      state.modal = "whatsapp-share";
+      state.error = "";
+      render();
+      break;
+    case "confirm-whatsapp-share": {
+      const draft = state.whatsappShareDraft;
+      if (!draft?.recipientHash || !state.whatsappShareReturned || !state.user || !state.profile?.isActive || state.busy) break;
+      state.busy = true;
+      state.error = "";
+      render();
+      try {
+        const profileRef = doc(db, "profiles", state.user.uid);
+        const shareRef = doc(db, "profiles", state.user.uid, "whatsappShares", draft.recipientHash);
+        const [profileSnapshot, existingShare] = await Promise.all([
+          getDoc(profileRef),
+          getDoc(shareRef),
+        ]);
+        if (!profileSnapshot.exists()) throw new Error("تعذر العثور على ملف الطالب.");
+        if (existingShare.exists()) throw new Error("تم احتساب هذا الرقم من قبل. أدخل رقم صديق مختلفاً.");
+        const currentCount = Number(profileSnapshot.data().whatsappShareCount || 0);
+        if (currentCount >= 10) throw new Error("اكتمل العدد المطلوب بالفعل.");
+        const batch = writeBatch(db);
+        batch.update(profileRef, {
+          whatsappShareCount: increment(1),
+          lastWhatsAppShareId: draft.recipientHash,
+        });
+        batch.set(shareRef, {
+          recipientHash: draft.recipientHash,
+          createdAt: serverTimestamp(),
+        });
+        await batch.commit();
+        const nextCount = currentCount + 1;
+        state.profile = {
+          ...profileSnapshot.data(),
+          whatsappShareCount: nextCount,
+          lastWhatsAppShareId: draft.recipientHash,
+        };
+        state.modal = "";
+        clearPendingWhatsAppShare();
+        listenSharedData();
+        notify(nextCount >= 10
+          ? "تم تأكيد الإرسال العاشر، وأصبحت منصات التعلّم متاحة."
+          : `تم تأكيد الإرسال. باقي ${10 - nextCount} أرقام مختلفة.`);
+      } catch (error) {
+        console.error("WhatsApp referral confirmation failed.", error);
+        state.error = messageFromError(error);
+      } finally {
+        state.busy = false;
+        render();
+      }
+      break;
+    }
+    case "cancel-whatsapp-share":
+      clearPendingWhatsAppShare();
       state.modal = "whatsapp-share";
       state.error = "";
       render();
@@ -2395,6 +2461,24 @@ root.addEventListener("input", (event) => {
     search?.setSelectionRange(position, position);
   }
   if (event.target.name === "text") state.chatText = event.target.value;
+});
+
+function markWhatsAppShareReturned() {
+  if (!state.whatsappSharePending || !state.whatsappShareLeftApp || state.whatsappShareReturned) return;
+  state.whatsappShareReturned = true;
+  render();
+}
+
+window.addEventListener("blur", () => {
+  if (state.whatsappSharePending) state.whatsappShareLeftApp = true;
+});
+window.addEventListener("focus", markWhatsAppShareReturned);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden" && state.whatsappSharePending) {
+    state.whatsappShareLeftApp = true;
+  } else {
+    markWhatsAppShareReturned();
+  }
 });
 
 window.addEventListener("beforeinstallprompt", (event) => {
