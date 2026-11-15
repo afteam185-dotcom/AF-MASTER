@@ -109,9 +109,6 @@ const state = {
   editingChapterId: null,
   editingLessonId: null,
   chatText: "",
-  whatsappSharePending: false,
-  whatsappShareReturned: false,
-  whatsappShareLeftApp: false,
 };
 
 const unsubscribers = new Map();
@@ -317,13 +314,6 @@ function timestampText(value, includeTime = false) {
 
 function remainingReferrals() {
   return Math.max(10 - Number(state.profile?.whatsappShareCount || 0), 0);
-}
-
-function clearPendingWhatsAppShare() {
-  state.whatsappShareDraft = null;
-  state.whatsappSharePending = false;
-  state.whatsappShareReturned = false;
-  state.whatsappShareLeftApp = false;
 }
 
 function normalizeCourseFilterValues(value) {
@@ -760,44 +750,35 @@ function listenSharedData() {
       unsubscribers.delete(key);
     }
   }
-  const canReadCourses = state.admin || Number(state.profile.whatsappShareCount || 0) >= 10;
-  if (!canReadCourses) {
-    state.courses = [];
-    state.selectedCourse = null;
-    state.selectedChapterId = "";
-    state.selectedLesson = null;
-    listenLessons(null);
-  } else {
-    const updateCourses = (records) => {
-      const sortedRecords = records.slice().sort((a, b) =>
-        (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
-      state.courses = state.admin ? sortedRecords : sortedRecords.filter((course) => courseMatchesProfile(course));
-      if (state.admin) {
-        state.catalogCount = records.length;
-        syncPublicStats();
-      }
-      if (state.selectedCourse) {
-        state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
-        if (!state.selectedCourse) {
-          state.selectedChapterId = "";
-          state.selectedLesson = null;
-          listenLessons(null);
-        }
-      }
-      render();
-    };
+  const updateCourses = (records) => {
+    const sortedRecords = records.slice().sort((a, b) =>
+      (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
+    state.courses = state.admin ? sortedRecords : sortedRecords.filter((course) => courseMatchesProfile(course));
     if (state.admin) {
-      listen("courses", query(collection(db, "courses")), (snapshot) => {
-        const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-        records.forEach((course) => migrateCourseAudience(course));
-        updateCourses(records);
-      });
-    } else {
-      const audienceKey = currentAudienceKey(state.profile);
-      listen("courses-student", collection(db, "studentCatalog", audienceKey, "courses"), (snapshot) => {
-        updateCourses(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-      });
+      state.catalogCount = records.length;
+      syncPublicStats();
     }
+    if (state.selectedCourse) {
+      state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
+      if (!state.selectedCourse) {
+        state.selectedChapterId = "";
+        state.selectedLesson = null;
+        listenLessons(null);
+      }
+    }
+    render();
+  };
+  if (state.admin) {
+    listen("courses", query(collection(db, "courses")), (snapshot) => {
+      const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      records.forEach((course) => migrateCourseAudience(course));
+      updateCourses(records);
+    });
+  } else {
+    const audienceKey = currentAudienceKey(state.profile);
+    listen("courses-student", collection(db, "studentCatalog", audienceKey, "courses"), (snapshot) => {
+      updateCourses(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+    });
   }
   listenAnnouncements();
 
@@ -835,9 +816,6 @@ async function markAnnouncementsSeen() {
 }
 
 function listenLessons(course) {
-  if (!state.admin && Number(state.profile?.whatsappShareCount || 0) < 10) {
-    course = null;
-  }
   if (!course) {
     state.chapters = [];
     state.lessons = [];
