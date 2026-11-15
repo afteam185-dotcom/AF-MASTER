@@ -6,9 +6,12 @@ import {
   getAuth,
   linkWithCredential,
   onAuthStateChanged,
+  reauthenticateWithCredential,
   signInWithEmailAndPassword,
   signInWithPopup,
   signOut,
+  updateEmail,
+  updatePassword,
 } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js";
 import {
   addDoc,
@@ -69,12 +72,14 @@ const state = {
   deviceError: "",
   adminDeviceCount: 0,
   studentLoginCode: null,
+  whatsappChannelOpened: false,
   authReady: false,
   introVisible: true,
   busy: false,
   error: "",
   notice: "",
   nav: "home",
+  navHistory: [],
   courses: [],
   catalogCount: 0,
   studentCount: 0,
@@ -142,12 +147,12 @@ function createStudentCode() {
 
 function createNumericLoginCode() {
   const digits = [];
-  while (digits.length < 24) {
+  while (digits.length < 8) {
     const bytes = crypto.getRandomValues(new Uint8Array(32));
     for (const byte of bytes) {
       if (byte >= 250) continue;
       digits.push(String(byte % 10));
-      if (digits.length === 24) break;
+      if (digits.length === 8) break;
     }
   }
   return digits.join("");
@@ -162,32 +167,41 @@ function linkedLoginCode(user) {
   const email = provider?.email || "";
   const suffix = `@${app.options.projectId}.firebaseapp.com`;
   const code = email.endsWith(suffix) ? email.slice(0, -suffix.length) : "";
-  return /^\d{24}$/.test(code) ? code : null;
+  return /^\d{8}$/.test(code) || /^\d{24}$/.test(code) ? code : null;
 }
 
 async function linkNumericLoginCode(user, code) {
   if (linkedLoginCode(user) === code) return user;
   if (user.providerData.some((item) => item.providerId === "password")) {
-    throw new Error("هذا الحساب مرتبط بالفعل بطريقة دخول أخرى بكلمة مرور، ولا يمكن استبدالها تلقائياً.");
+    const oldCode = linkedLoginCode(user);
+    if (!oldCode || !/^\d{8}$/.test(code)) {
+      throw new Error("تعذر تحديث كود الدخول. سجّل الدخول بحساب Google ثم أعد المحاولة.");
+    }
+    await reauthenticateWithCredential(
+      user,
+      EmailAuthProvider.credential(loginEmailForCode(oldCode), oldCode),
+    );
+    await updateEmail(user, loginEmailForCode(code));
+    await updatePassword(user, code);
+    await user.reload();
+    return auth.currentUser || user;
   }
   const credential = EmailAuthProvider.credential(loginEmailForCode(code), code);
   const result = await linkWithCredential(user, credential);
   return result.user;
 }
 
-async function saveNumericLoginCode(uid, code) {
-  if (!/^\d{24}$/.test(code)) throw new Error("كود الدخول غير صالح.");
+async function saveNumericLoginCode(uid, code, previousCode = null) {
+  if (!/^\d{8}$/.test(code)) throw new Error("كود الدخول يجب أن يتكون من 8 أرقام.");
   const codeRef = doc(db, "profiles", uid, "privateAuth", "login");
   const existing = await getDoc(codeRef);
-  if (existing.exists() && existing.data().loginCode !== code) {
+  if (existing.exists() && existing.data().loginCode === code) return;
+  if (existing.exists() && existing.data().loginCode !== previousCode) {
     throw new Error("يوجد كود دخول مختلف محفوظ لهذا الحساب.");
   }
-  if (existing.exists()) return;
   const batch = writeBatch(db);
-  batch.set(codeRef, {
-    loginCode: code,
-    createdAt: serverTimestamp(),
-  });
+  if (existing.exists()) batch.update(codeRef, { loginCode: code });
+  else batch.set(codeRef, { loginCode: code, createdAt: serverTimestamp() });
   batch.set(doc(db, "loginCodes", code), {
     uid,
     createdAt: serverTimestamp(),
@@ -237,6 +251,12 @@ function messageFromError(error) {
 function loginCodeSetupError(error) {
   if (error?.code === "auth/operation-not-allowed") {
     return "فعّل مزوّد Email/Password في إعدادات Firebase Authentication لتفعيل الدخول بالكود.";
+  }
+  if (error?.code === "auth/email-already-in-use") {
+    return "هذا الكود مستخدم بالفعل. حاول تحديث الكود مرة أخرى.";
+  }
+  if (error?.code === "auth/invalid-credential") {
+    return "تعذر التحقق من الكود السابق. سجّل الدخول بحساب Google ثم حاول التحديث.";
   }
   if (error?.code === "permission-denied" || error?.code === "firestore/permission-denied") {
     return "تعذر حفظ كود الدخول. انشر قواعد Firestore المحدّثة ثم أعد المحاولة.";
@@ -631,6 +651,7 @@ function listenProfile(uid) {
         state.supportPreviews = {};
         state.supportDraftOpen = false;
         state.studentLoginCode = null;
+        state.whatsappChannelOpened = false;
         unsubscribers.get("warnings")?.();
         unsubscribers.delete("warnings");
         unsubscribers.get("student-login-code")?.();
@@ -670,10 +691,10 @@ function listenStudentLoginCode(uid) {
   listen("student-login-code", doc(db, "profiles", uid, "privateAuth", "login"), (snapshot) => {
     const storedCode = snapshot.exists() ? snapshot.data().loginCode : null;
     const authCode = linkedLoginCode(state.user);
-    state.studentLoginCode = storedCode || authCode;
+    state.studentLoginCode = authCode || storedCode;
     render();
-    if (!storedCode && authCode) {
-      saveNumericLoginCode(uid, authCode).catch(fail);
+    if (/^\d{8}$/.test(authCode || "") && storedCode !== authCode) {
+      saveNumericLoginCode(uid, authCode, storedCode).catch(fail);
     }
   });
 }
@@ -1077,6 +1098,7 @@ onAuthStateChanged(auth, async (user) => {
   state.user = user;
   state.profile = null;
   state.studentLoginCode = null;
+  state.whatsappChannelOpened = false;
   state.device = null;
   state.deviceError = "";
   state.admin = false;
@@ -1220,7 +1242,7 @@ function shell(content) {
   }[state.nav] || "الرئيسية";
   return `<div class="app-shell">${sidebar()}<main class="main-area">
     <header class="topbar"><div class="breadcrumb"><span>AF MASTER</span><span>←</span><b>${h(navLabel)}</b></div>
-    <div class="top-actions">${state.installPrompt ? `<button class="button button-outline install-top" data-action="install">▣ تثبيت التطبيق</button>` : ""}<button class="icon-button" title="تسجيل الخروج" data-action="logout">↪</button><button class="profile-top" data-action="profile"><span class="avatar small">${h(displayName().slice(0, 1))}</span><span>${h(displayName().split(" ")[0])}</span></button></div></header>
+    <div class="top-actions">${state.installPrompt ? `<button class="button button-outline install-top" data-action="install">▣ تثبيت التطبيق</button>` : ""}<button class="icon-button" title="العودة للصفحة السابقة" data-action="back-page">↩</button><button class="profile-top" data-action="profile"><span class="avatar small">${h(displayName().slice(0, 1))}</span><span>${h(displayName().split(" ")[0])}</span></button></div></header>
     ${state.error || state.notice ? `<div class="toast ${state.error ? "toast-error" : ""}" role="status"><span>${h(state.error || state.notice)}</span><button data-action="dismiss">×</button></div>` : ""}
     <div class="page-content">${content}</div>
   </main></div>${modalView()}`;
@@ -1449,20 +1471,19 @@ function modalView() {
       <div class="channel-icon" aria-hidden="true">◉</div>
       <span class="eyebrow">خليك قريب من AF MASTER</span>
       <h2 id="channel-modal-title">اشترك في قناة واتساب</h2>
-      <p class="muted">اشترك على القناة عشان يوصلك كل جديد، إحنا مش بنرخم عليك بس عشان تبقى عارف إحنا فين!</p>
-      <a class="button channel-button" href="https://whatsapp.com/channel/0029VbE2SzLJkK776ZAkwG23" target="_blank" rel="noopener noreferrer"><span aria-hidden="true">◉</span> افتح قناة AF MASTER على واتساب</a>
+      <p class="muted">${state.whatsappChannelOpened ? "بعد الاشتراك في القناة، ارجع هنا واضغط للتأكيد والمتابعة." : "اضغط الزر لفتح قناة AF MASTER على واتساب، ثم ارجع واضغط مرة أخرى للتأكيد."}</p>
       ${state.error ? `<div class="inline-error" role="alert">${h(state.error)}</div>` : ""}
-      <button class="button button-primary button-wide" data-action="confirm-channel-subscription" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ حفظ التأكيد..." : "اشتركت، متابعة ←"}</button>
+      <button class="button button-primary button-wide" data-action="confirm-channel-subscription" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ حفظ التأكيد..." : state.whatsappChannelOpened ? "اشتركت، متابعة ←" : "افتح قناة واتساب ←"}</button>
       <small class="channel-note">بعد التأكيد لن تظهر لك هذه الخطوة مرة أخرى.</small>
     </section></div>`;
   }
   if (!state.modal) return "";
   if (state.modal === "code-login") {
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>تسجيل الدخول بالكود</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">أدخل كود الدخول الرقمي المكوّن من 24 رقماً.</p><form class="form-grid" data-form="code-login"><label>كود الطالب<input name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9٠-٩۰-۹]{24}" maxlength="24" minlength="24" required dir="ltr" placeholder="••••••••••••••••••••••••"></label>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}<button class="button button-primary" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ التحقق..." : "دخول آمن ←"}</button></form></section></div>`;
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>تسجيل الدخول بالكود</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">أدخل كود الدخول الرقمي المكوّن من 8 أرقام.</p><form class="form-grid" data-form="code-login"><label>كود الطالب<input name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9٠-٩۰-۹]{8}" maxlength="8" minlength="8" required dir="ltr" placeholder="••••••••"></label>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}<button class="button button-primary" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ التحقق..." : "دخول آمن ←"}</button></form></section></div>`;
   }
   if (state.modal === "student-login-code" && state.studentLoginCode) {
     const activeCode = linkedLoginCode(state.user) === state.studentLoginCode;
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>كود دخولك الرقمي</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${activeCode ? "احتفظ بهذا الكود بسرية؛ يمكن استخدامه وحده للدخول إلى حسابك." : "احفظ الكود، ثم فعّل تسجيل الدخول به. استخدم Google إلى أن يظهر تأكيد التفعيل."}</p><div class="profile-details"><div><span>كود الطالب — 24 رقمًا</span><b class="code" dir="ltr">${h(state.studentLoginCode)}</b></div></div><div class="form-grid"><button type="button" class="button button-outline" data-copy="${h(state.studentLoginCode)}">نسخ الكود</button>${activeCode ? "" : `<button class="button button-primary" data-action="enable-code-login" ${state.busy ? "disabled" : ""}>تفعيل كود الدخول</button>`}</div>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}</section></div>`;
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>كود دخولك الرقمي</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${activeCode && /^\d{8}$/.test(state.studentLoginCode) ? "احتفظ بهذا الكود بسرية؛ يمكن استخدامه وحده للدخول إلى حسابك." : "حدّث الكود إلى 8 أرقام لتسجيل الدخول به. استخدم Google إلى أن يكتمل التحديث."}</p><div class="profile-details"><div><span>كود الطالب — ${state.studentLoginCode.length} أرقام</span><b class="code" dir="ltr">${h(state.studentLoginCode)}</b></div></div><div class="form-grid"><button type="button" class="button button-outline" data-copy="${h(state.studentLoginCode)}">نسخ الكود</button>${activeCode && /^\d{8}$/.test(state.studentLoginCode) ? "" : `<button class="button button-primary" data-action="enable-code-login" ${state.busy ? "disabled" : ""}>${state.studentLoginCode.length === 24 ? "تحديث الكود إلى 8 أرقام" : "تفعيل كود الدخول"}</button>`}</div>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}</section></div>`;
   }
   if (state.modal === "whatsapp-share") {
     return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>أضف رقم صديق</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">أدخل رقم واتساب بصيغة صحيحة ومختلفاً. يُحتسب الرقم فور إضافته؛ إرسال الرسالة أو تسجيل الصديق غير مطلوب.</p><form class="form-grid" data-form="whatsapp-share"><label>رقم واتساب مع مفتاح الدولة<input name="phone" type="tel" inputmode="tel" autocomplete="tel" required placeholder="+20 10 1234 5678 أو 01012345678"></label><small class="referral-hint">نتحقق من صيغة الرقم وتكراره في حسابك فقط، ولا نستطيع تأكيد أنه رقم فعّال دون تحقق خارجي.</small>${state.error ? `<div class="inline-error">${h(state.error)}</div>` : ""}<button class="button button-primary" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ حفظ الرقم..." : "إضافة الرقم ←"}</button></form></section></div>`;
@@ -1473,9 +1494,9 @@ function modalView() {
   }
   if (state.modal === "profile") {
     const loginCode = state.studentLoginCode || linkedLoginCode(state.user);
-    const codeEnabled = Boolean(loginCode && linkedLoginCode(state.user) === loginCode);
+    const codeEnabled = Boolean(loginCode && /^\d{8}$/.test(loginCode) && linkedLoginCode(state.user) === loginCode);
     return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>إعدادات الحساب</h2><button class="icon-button" data-action="close-modal">×</button></div>
-      ${state.admin ? `<div class="profile-details"><div><span>الحساب</span><b>${h(state.user.email || "دخول آمن للمشرف")}</b></div><div><span>الدور</span><b>مشرف AF MASTER</b></div><button class="button button-outline" data-action="logout">تسجيل الخروج</button></div>` : `<form class="form-grid" data-form="school-info"><p class="muted">كود الدعوة: <b class="code">${h(state.profile.studentCode || "—")}</b></p><div class="profile-details"><div><span>كود الدخول الرقمي (سري)</span><b class="code" dir="ltr">${h(loginCode || "غير مفعّل")}</b></div><small>لا تشارك كود الدخول مع أي شخص.</small><button type="button" class="button button-outline" data-action="enable-code-login" ${state.busy || codeEnabled ? "disabled" : ""}>${codeEnabled ? "كود الدخول مفعّل ✓" : loginCode ? "تفعيل كود الدخول" : "إنشاء كود دخول رقمي"}</button>${loginCode ? `<button type="button" class="text-button" data-copy="${h(loginCode)}">نسخ كود الدخول</button>` : ""}</div><label>الصف الدراسي<select name="grade">${gradeOptions(state.profile.grade)}</select></label><label>المسار<select name="track">${trackOptions(state.profile.track)}</select></label><button class="button button-primary">حفظ التعديلات</button></form>`}</section></div>`;
+      ${state.admin ? `<div class="profile-details"><div><span>الحساب</span><b>${h(state.user.email || "دخول آمن للمشرف")}</b></div><div><span>الدور</span><b>مشرف AF MASTER</b></div><button class="button button-outline" data-action="logout">تسجيل الخروج</button></div>` : `<form class="form-grid" data-form="school-info"><p class="muted">كود الدعوة: <b class="code">${h(state.profile.studentCode || "—")}</b></p><div class="profile-details"><div><span>كود الدخول الرقمي (سري)</span><b class="code" dir="ltr">${h(loginCode || "غير مفعّل")}</b></div><small>لا تشارك كود الدخول مع أي شخص.</small><button type="button" class="button button-outline" data-action="enable-code-login" ${state.busy || codeEnabled ? "disabled" : ""}>${codeEnabled ? "كود الدخول مفعّل ✓" : loginCode && /^\d{24}$/.test(loginCode) ? "تحديث الكود إلى 8 أرقام" : loginCode ? "تفعيل كود الدخول" : "إنشاء كود دخول رقمي"}</button>${loginCode ? `<button type="button" class="text-button" data-copy="${h(loginCode)}">نسخ كود الدخول</button>` : ""}</div><label>الصف الدراسي<select name="grade">${gradeOptions(state.profile.grade)}</select></label><label>المسار<select name="track">${trackOptions(state.profile.track)}</select></label><button class="button button-primary">حفظ التعديلات</button><button type="button" class="button button-outline" data-action="logout">تسجيل الخروج</button></form>`}</section></div>`;
   }
   if (state.modal === "course") {
     const course = state.courses.find((item) => item.id === state.editingCourseId) || state.selectedCourse;
@@ -1539,7 +1560,7 @@ async function handleSubmit(event) {
     switch (form.dataset.form) {
       case "code-login": {
         const code = latinDigits(data.code).trim();
-        if (!/^\d{24}$/.test(code)) throw new Error("أدخل كود الدخول المكوّن من 24 رقماً.");
+        if (!/^\d{8}$/.test(code)) throw new Error("أدخل كود الدخول المكوّن من 8 أرقام.");
         const credential = await signInWithEmailAndPassword(auth, loginEmailForCode(code), code);
         await credential.user.getIdToken(true);
         const profileSnapshot = await getDoc(doc(db, "profiles", credential.user.uid));
@@ -1882,6 +1903,7 @@ async function logout() {
   state.deviceError = "";
   state.modal = "";
   state.nav = "home";
+  state.navHistory = [];
 }
 
 async function loginWithGoogle() {
@@ -1907,10 +1929,14 @@ async function enableStudentCodeLogin() {
   render();
   let code = null;
   try {
-    code = state.studentLoginCode || linkedLoginCode(state.user) || createNumericLoginCode();
-    state.studentLoginCode = code;
+    const currentCode = linkedLoginCode(state.user);
+    const previousCode = state.studentLoginCode || currentCode;
+    code = currentCode && /^\d{8}$/.test(currentCode)
+      ? currentCode
+      : createNumericLoginCode();
     state.user = await linkNumericLoginCode(auth.currentUser || state.user, code);
-    await saveNumericLoginCode(state.user.uid, code);
+    await saveNumericLoginCode(state.user.uid, code, previousCode);
+    state.studentLoginCode = code;
     notify("تم تفعيل الدخول بالكود الرقمي. احتفظ به بسرية.");
   } catch (error) {
     console.error("Student code-login setup failed.", error);
@@ -1986,6 +2012,19 @@ async function clickAction(action, target, originalTarget) {
       break;
     case "confirm-channel-subscription":
       if (state.busy || state.admin || !state.user || !state.profile?.isActive || state.profile.whatsappChannelJoined) break;
+      if (!state.whatsappChannelOpened) {
+        const channelWindow = window.open("https://whatsapp.com/channel/0029VbE2SzLJkK776ZAkwG23", "_blank");
+        if (!channelWindow) {
+          state.error = "تعذر فتح قناة واتساب. اسمح بالنوافذ المنبثقة ثم حاول مرة أخرى.";
+          render();
+          break;
+        }
+        channelWindow.opener = null;
+        state.whatsappChannelOpened = true;
+        state.error = "";
+        render();
+        break;
+      }
       state.busy = true;
       state.error = "";
       render();
@@ -2026,6 +2065,7 @@ async function clickAction(action, target, originalTarget) {
       render();
       break;
     case "logout": await logout(); break;
+    case "back-page": goBack(); break;
     case "dismiss": state.error = ""; state.notice = ""; render(); break;
     case "profile": state.modal = "profile"; render(); break;
     case "edit-course":
@@ -2210,54 +2250,78 @@ async function moderateStudent(uid, ban) {
   }
 }
 
+function navigateTo(nav, remember = true, clearSupportTarget = true) {
+  if (remember && state.nav !== nav) {
+    state.navHistory.push(state.nav);
+    if (state.navHistory.length > 20) state.navHistory.shift();
+  }
+  state.nav = nav;
+  state.selectedLesson = null;
+  if (state.admin && state.nav === "support" && clearSupportTarget) {
+    state.supportTarget = "";
+    state.chatText = "";
+  }
+  if (state.nav === "learning") listenLessons(state.selectedCourse);
+  if (state.nav === "chat" || state.nav === "support") listenChat();
+  else {
+    for (const key of ["chat0", "chat1", "support-room", "support-inbox"]) {
+      unsubscribers.get(key)?.();
+      unsubscribers.delete(key);
+    }
+    window.clearTimeout(chatExpiryTimer);
+    chatExpiryTimer = null;
+    window.clearTimeout(supportReplyTimer);
+    supportReplyTimer = null;
+  }
+  if (state.nav === "updates") markAnnouncementsSeen();
+  state.error = "";
+  render();
+}
+
+function goBack() {
+  if (state.nav === "learning" && state.selectedLesson) {
+    state.selectedLesson = null;
+    render();
+    return;
+  }
+  if (state.nav === "learning" && state.selectedCourse) {
+    state.selectedCourse = null;
+    state.selectedChapterId = "";
+    state.selectedLesson = null;
+    listenLessons(null);
+    render();
+    return;
+  }
+  if (state.admin && state.nav === "support" && state.supportTarget) {
+    state.supportTarget = "";
+    state.chatText = "";
+    state.chatMessages = [];
+    listenChat();
+    render();
+    return;
+  }
+  navigateTo(state.navHistory.pop() || "home", false);
+}
+
 async function handleClick(event) {
   const navButton = event.target.closest("[data-nav]");
   if (navButton) {
-    state.nav = navButton.dataset.nav;
-    state.selectedLesson = null;
-    if (state.admin && state.nav === "support") {
-      state.supportTarget = "";
-      state.chatText = "";
-    }
-    if (state.nav === "learning") listenLessons(state.selectedCourse);
-    if (state.nav === "chat" || state.nav === "support") listenChat();
-    else {
-      unsubscribers.get("chat0")?.();
-      unsubscribers.get("chat1")?.();
-      unsubscribers.get("support-room")?.();
-      unsubscribers.get("support-inbox")?.();
-      unsubscribers.delete("chat0");
-      unsubscribers.delete("chat1");
-      unsubscribers.delete("support-room");
-      unsubscribers.delete("support-inbox");
-      window.clearTimeout(chatExpiryTimer);
-      chatExpiryTimer = null;
-      window.clearTimeout(supportReplyTimer);
-      supportReplyTimer = null;
-    }
-    if (state.nav === "updates") markAnnouncementsSeen();
-    state.error = "";
-    render();
+    navigateTo(navButton.dataset.nav);
     return;
   }
   const supportRoomButton = event.target.closest("[data-support-target]");
   if (supportRoomButton && state.admin) {
     state.supportTarget = supportRoomButton.dataset.supportTarget;
     state.chatText = "";
-    state.nav = "support";
-    listenChat();
-    render();
+    navigateTo("support", true, false);
     return;
   }
   const courseButton = event.target.closest("[data-course]");
   if (courseButton) {
     state.selectedCourse = state.courses.find((course) => course.id === courseButton.dataset.course) || null;
     state.selectedChapterId = "";
-    state.selectedLesson = null;
     state.examLessonId = "";
-    state.nav = "learning";
-    listenLessons(state.selectedCourse);
-    render();
+    navigateTo("learning");
     return;
   }
   const lessonButton = event.target.closest(".lesson-row[data-lesson]");

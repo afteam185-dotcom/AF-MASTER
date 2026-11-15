@@ -247,7 +247,7 @@ service cloud.firestore {
         /databases/$(database)/documents/profiles/$(uid)/privateAuth/login
       ).data.loginCode;
       return code is string
-        && code.matches('^[0-9]{24}$')
+        && code.matches('^[0-9]{8}$')
         && existsAfter(/databases/$(database)/documents/loginCodes/$(code))
         && getAfter(/databases/$(database)/documents/loginCodes/$(code)).data.uid == uid;
     }
@@ -384,9 +384,15 @@ service cloud.firestore {
         allow create: if isSelf(uid)
           && credentialId == 'login'
           && request.resource.data.keys().hasOnly(['loginCode', 'createdAt'])
-          && request.resource.data.loginCode.matches('^[0-9]{24}$')
+          && request.resource.data.loginCode.matches('^[0-9]{8}$')
           && request.resource.data.createdAt == request.time;
-        allow update, delete: if false;
+        allow update: if isSelf(uid)
+          && credentialId == 'login'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['loginCode'])
+          && request.resource.data.loginCode.matches('^[0-9]{8}$')
+          && existsAfter(/databases/$(database)/documents/loginCodes/$(request.resource.data.loginCode))
+          && getAfter(/databases/$(database)/documents/loginCodes/$(request.resource.data.loginCode)).data.uid == uid;
+        allow delete: if false;
       }
       match /whatsappShares/{shareId} {
         allow get: if isSelf(uid) || isAdmin();
@@ -407,7 +413,7 @@ service cloud.firestore {
       allow get: if isSelf(resource.data.uid);
       allow list: if false;
       allow create: if isSelf(request.resource.data.uid)
-        && code.matches('^[0-9]{24}$')
+        && code.matches('^[0-9]{8}$')
         && request.resource.data.keys().hasOnly(['uid', 'createdAt'])
         && request.resource.data.createdAt == request.time
         && existsAfter(/databases/$(database)/documents/profiles/$(request.auth.uid)/privateAuth/login)
