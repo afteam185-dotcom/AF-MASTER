@@ -19,8 +19,7 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.isActive == true;
     }
     function hasLearningAccess() {
-      return hasActiveProfile()
-        && get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.get('whatsappShareCount', 0) >= 10;
+      return hasActiveProfile();
     }
     function matchesCourseGrade(course, student) {
       return course.keys().hasAny(['grade'])
