@@ -73,6 +73,7 @@ const state = {
   adminDeviceCount: 0,
   studentLoginCode: null,
   whatsappChannelOpened: false,
+  whatsappChannelReady: false,
   authReady: false,
   introVisible: true,
   busy: false,
@@ -115,6 +116,7 @@ let sharedDataSubscriptionKey = null;
 let announcementExpiryTimer = null;
 let chatExpiryTimer = null;
 let supportReplyTimer = null;
+let whatsappChannelTimer = null;
 const supportHistoryUpdates = new Set();
 const supportHistoryRooms = new Set();
 const supportPreviewLoads = new Set();
@@ -644,6 +646,8 @@ function listenProfile(uid) {
         if (!unsubscribers.has("warnings")) listenWarnings(uid);
         if (!unsubscribers.has("student-login-code")) listenStudentLoginCode(uid);
       } else {
+        window.clearTimeout(whatsappChannelTimer);
+        whatsappChannelTimer = null;
         state.warnings = [];
         state.chatMessages = [];
         state.supportRooms = [];
@@ -652,6 +656,7 @@ function listenProfile(uid) {
         state.supportDraftOpen = false;
         state.studentLoginCode = null;
         state.whatsappChannelOpened = false;
+        state.whatsappChannelReady = false;
         unsubscribers.get("warnings")?.();
         unsubscribers.delete("warnings");
         unsubscribers.get("student-login-code")?.();
@@ -1098,7 +1103,10 @@ onAuthStateChanged(auth, async (user) => {
   state.user = user;
   state.profile = null;
   state.studentLoginCode = null;
+  window.clearTimeout(whatsappChannelTimer);
+  whatsappChannelTimer = null;
   state.whatsappChannelOpened = false;
+  state.whatsappChannelReady = false;
   state.device = null;
   state.deviceError = "";
   state.admin = false;
@@ -1471,9 +1479,9 @@ function modalView() {
       <div class="channel-icon" aria-hidden="true">◉</div>
       <span class="eyebrow">خليك قريب من AF MASTER</span>
       <h2 id="channel-modal-title">اشترك في قناة واتساب</h2>
-      <p class="muted">${state.whatsappChannelOpened ? "بعد الاشتراك في القناة، ارجع هنا واضغط للتأكيد والمتابعة." : "اضغط الزر لفتح قناة AF MASTER على واتساب، ثم ارجع واضغط مرة أخرى للتأكيد."}</p>
+      <p class="muted">${state.whatsappChannelReady ? "بعد الاشتراك في القناة، اضغط للتأكيد والمتابعة." : state.whatsappChannelOpened ? "انتظر 10 ثوانٍ بعد فتح القناة؛ بعدها سيظهر زر التأكيد." : "اضغط الزر لفتح قناة AF MASTER على واتساب."}</p>
       ${state.error ? `<div class="inline-error" role="alert">${h(state.error)}</div>` : ""}
-      <button class="button button-primary button-wide" data-action="confirm-channel-subscription" ${state.busy ? "disabled" : ""}>${state.busy ? "جارٍ حفظ التأكيد..." : state.whatsappChannelOpened ? "اشتركت، متابعة ←" : "افتح قناة واتساب ←"}</button>
+      <button class="button button-primary button-wide" data-action="confirm-channel-subscription" ${state.busy || (state.whatsappChannelOpened && !state.whatsappChannelReady) ? "disabled" : ""}>${state.busy ? "جارٍ حفظ التأكيد..." : state.whatsappChannelReady ? "اشتركت، متابعة ←" : "افتح قناة واتساب ←"}</button>
       <small class="channel-note">بعد التأكيد لن تظهر لك هذه الخطوة مرة أخرى.</small>
     </section></div>`;
   }
@@ -2021,16 +2029,27 @@ async function clickAction(action, target, originalTarget) {
         }
         channelWindow.opener = null;
         state.whatsappChannelOpened = true;
+        state.whatsappChannelReady = false;
+        const uid = state.user.uid;
+        whatsappChannelTimer = window.setTimeout(() => {
+          whatsappChannelTimer = null;
+          if (state.user?.uid !== uid || !state.whatsappChannelOpened || state.profile?.whatsappChannelJoined) return;
+          state.whatsappChannelReady = true;
+          render();
+        }, 10000);
         state.error = "";
         render();
         break;
       }
+      if (!state.whatsappChannelReady) break;
       state.busy = true;
       state.error = "";
       render();
       try {
         await updateDoc(doc(db, "profiles", state.user.uid), { whatsappChannelJoined: true });
         state.profile = { ...state.profile, whatsappChannelJoined: true };
+        state.whatsappChannelOpened = false;
+        state.whatsappChannelReady = false;
         notify("تم حفظ تأكيد الاشتراك. أهلاً بك في AF MASTER!");
       } catch (error) {
         console.error("WhatsApp channel subscription confirmation failed.", error);
