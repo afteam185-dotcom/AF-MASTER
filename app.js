@@ -717,48 +717,41 @@ function listenSharedData() {
     return;
   }
   listenCatalogCount();
-  const canReadCourses = state.admin || Number(state.profile.whatsappShareCount || 0) >= 10;
   for (const key of [...unsubscribers.keys()]) {
     if (key === "courses" || key === "courses-student") {
       unsubscribers.get(key)?.();
       unsubscribers.delete(key);
     }
   }
-  if (!canReadCourses) {
-    state.courses = [];
-  } else {
-    const updateCourses = (records) => {
-      const sortedRecords = records.slice().sort((a, b) =>
-        (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
-      state.courses = state.admin ? sortedRecords : sortedRecords.filter((course) => courseMatchesProfile(course));
-      if (state.admin) {
-        state.catalogCount = records.length;
-        syncPublicStats();
-      }
-      if (state.selectedCourse) {
-        state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
-        if (!state.selectedCourse) {
-          state.selectedChapterId = "";
-          state.selectedLesson = null;
-          listenLessons(null);
-        }
-      }
-      render();
-    };
+  const updateCourses = (records) => {
+    const sortedRecords = records.slice().sort((a, b) =>
+      (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
+    state.courses = state.admin ? sortedRecords : sortedRecords.filter((course) => courseMatchesProfile(course));
     if (state.admin) {
-      listen("courses", query(collection(db, "courses")), (snapshot) => {
-        const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-        records.forEach((course) => migrateCourseAudience(course));
-        updateCourses(records);
-      });
-    } else {
-      listen("courses-student", query(
-        collection(db, "courses"),
-        where("audienceKeys", "array-contains", currentAudienceKey(state.profile)),
-      ), (snapshot) => {
-        updateCourses(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-      });
+      state.catalogCount = records.length;
+      syncPublicStats();
     }
+    if (state.selectedCourse) {
+      state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
+      if (!state.selectedCourse) {
+        state.selectedChapterId = "";
+        state.selectedLesson = null;
+        listenLessons(null);
+      }
+    }
+    render();
+  };
+  if (state.admin) {
+    listen("courses", query(collection(db, "courses")), (snapshot) => {
+      const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      records.forEach((course) => migrateCourseAudience(course));
+      updateCourses(records);
+    });
+  } else {
+    const audienceKey = currentAudienceKey(state.profile);
+    listen("courses-student", collection(db, "studentCatalog", audienceKey, "courses"), (snapshot) => {
+      updateCourses(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+    });
   }
   listenAnnouncements();
 
@@ -808,22 +801,12 @@ function listenLessons(course) {
   state.chapters = [];
   state.lessons = [];
   const audienceKey = !state.admin && state.profile ? currentAudienceKey(state.profile) : "";
-  const chapterCollection = collection(db, "chapters");
-  const lessonCollection = collection(db, "lessons");
   const chapterQuery = state.admin
-    ? query(chapterCollection, where("courseId", "==", course.id))
-    : query(
-      chapterCollection,
-      where("courseId", "==", course.id),
-      where("audienceKeys", "array-contains", audienceKey),
-    );
+    ? query(collection(db, "chapters"), where("courseId", "==", course.id))
+    : collection(db, "studentCatalog", audienceKey, "courses", course.id, "chapters");
   const lessonQuery = state.admin
-    ? query(lessonCollection, where("courseId", "==", course.id))
-    : query(
-      lessonCollection,
-      where("courseId", "==", course.id),
-      where("audienceKeys", "array-contains", audienceKey),
-    );
+    ? query(collection(db, "lessons"), where("courseId", "==", course.id))
+    : collection(db, "studentCatalog", audienceKey, "courses", course.id, "lessons");
   listen("chapters", chapterQuery, (snapshot) => {
     state.chapters = snapshot.docs
       .map((item) => ({ id: item.id, ...item.data() }))
@@ -1349,10 +1332,6 @@ function chapterGroups() {
 }
 
 function learningView() {
-  if (!state.admin && Number(state.profile?.whatsappShareCount || 0) < 10) {
-    return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>افتح منصات التعلّم</h1><p>أضف أرقام واتساب مختلفة لفتح المنصات.</p></div></div>
-      <section class="unlock-card"><div class="unlock-art">♧</div><span class="eyebrow">مش لازم أصحابك يسجلوا</span><h2>باقي لك ${remainingReferrals()} أرقام مختلفة</h2><p>أضف أرقام واتساب لعشرة أشخاص مختلفين. يُفتح المحتوى فور إضافة الرقم العاشر؛ لا يُشترط أن يرسل أصدقاؤك أي شيء أو ينشئوا حساباً.</p>${progressBlock()}<button class="button button-primary" data-action="share">أضف رقم صديق</button></section></div>`;
-  }
   if (state.selectedLesson) return lessonView();
   if (state.selectedCourse) {
     const groups = chapterGroups();
