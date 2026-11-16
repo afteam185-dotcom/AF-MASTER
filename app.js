@@ -345,15 +345,6 @@ function courseAudienceFilters(course) {
   };
 }
 
-function courseMatchesProfile(course) {
-  const currentProfile = state.profile;
-  if (!currentProfile) return true;
-  const filters = courseAudienceFilters(course || {});
-  const gradeMatch = filters.grades.includes(currentProfile.grade);
-  const trackMatch = filters.tracks.includes(currentProfile.track) || filters.tracks.includes("كلاهما");
-  return gradeMatch && trackMatch;
-}
-
 function courseAudienceKeys(course) {
   const filters = courseAudienceFilters(course);
   const expandedTracks = filters.tracks.includes("كلاهما") ? tracks : filters.tracks;
@@ -772,7 +763,7 @@ function listenSharedData() {
   const updateCourses = (records) => {
     const sortedRecords = records.slice().sort((a, b) =>
       (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
-    state.courses = state.admin ? sortedRecords : sortedRecords.filter((course) => courseMatchesProfile(course));
+    state.courses = sortedRecords;
     if (state.admin) {
       state.catalogCount = records.length;
       syncPublicStats();
