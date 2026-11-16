@@ -450,6 +450,62 @@ async function syncAudienceItems(course, collectionName, documents) {
   await commitAudienceIndexOperations(operations);
 }
 
+async function saveEducationRecord(collectionName, existingRecord, data) {
+  const recordRef = existingRecord
+    ? doc(db, collectionName, existingRecord.id)
+    : doc(collection(db, collectionName));
+  const previousAudienceKeys = Array.isArray(existingRecord?.audienceKeys)
+    ? existingRecord.audienceKeys
+    : [];
+  const audienceKeys = Array.isArray(data.audienceKeys) ? data.audienceKeys : [];
+  const existingData = { ...existingRecord };
+  delete existingData.id;
+  const recordData = { ...existingData, ...data };
+  const batch = writeBatch(db);
+
+  if (existingRecord) batch.update(recordRef, data);
+  else batch.set(recordRef, data);
+
+  for (const audienceKey of audienceKeys) {
+    batch.set(audienceContentRef(audienceKey, data.courseId, collectionName, recordRef.id), recordData);
+  }
+  for (const audienceKey of previousAudienceKeys) {
+    if (!audienceKeys.includes(audienceKey)) {
+      batch.delete(audienceContentRef(audienceKey, data.courseId, collectionName, recordRef.id));
+    }
+  }
+  await batch.commit();
+  return recordRef.id;
+}
+
+async function saveCourseAudienceCopies(existingCourse, courseData) {
+  const courseRef = existingCourse
+    ? doc(db, "courses", existingCourse.id)
+    : doc(collection(db, "courses"));
+  const courseId = existingCourse?.id || courseRef.id;
+  const previousAudienceKeys = Array.isArray(existingCourse?.audienceKeys)
+    ? existingCourse.audienceKeys
+    : existingCourse ? courseAudienceKeys(existingCourse) : [];
+  const audienceKeys = Array.isArray(courseData.audienceKeys) ? courseData.audienceKeys : [];
+  const existingData = { ...existingCourse };
+  delete existingData.id;
+  const audienceData = { ...existingData, ...courseData, id: courseId };
+  const batch = writeBatch(db);
+  if (existingCourse) batch.update(courseRef, courseData);
+  else batch.set(courseRef, courseData);
+
+  for (const audienceKey of audienceKeys) {
+    batch.set(audienceCourseRef(audienceKey, courseId), audienceData);
+  }
+  for (const audienceKey of previousAudienceKeys) {
+    if (!audienceKeys.includes(audienceKey)) {
+      batch.delete(audienceCourseRef(audienceKey, courseId));
+    }
+  }
+  await batch.commit();
+  return courseId;
+}
+
 async function migrateCourseAudience(course) {
   const audienceKeys = courseAudienceKeys(course);
   const previousCourse = state.courses.find((item) => item.id === course.id);
@@ -1815,26 +1871,25 @@ async function handleSubmit(event) {
         const audienceKeys = courseAudienceKeys({ grade: gradeValue, track: trackValue });
         let notice;
         if (state.editingCourseId) {
-          await updateDoc(doc(db, "courses", state.editingCourseId), {
+          const existingCourse = state.courses.find((item) => item.id === state.editingCourseId);
+          if (!existingCourse) throw new Error("تعذر العثور على المنصة المطلوب تعديلها.");
+          const courseData = {
             title,
             description,
             grade: gradeValue,
             track: trackValue,
             audienceKeys,
-          });
+          };
+          await saveCourseAudienceCopies(existingCourse, courseData);
           if (state.selectedCourse?.id === state.editingCourseId) {
             state.selectedCourse = {
               ...state.selectedCourse,
-              title,
-              description,
-              grade: gradeValue,
-              track: trackValue,
-              audienceKeys,
+              ...courseData,
             };
           }
           notice = "تم تحديث المنصة.";
         } else {
-          await addDoc(collection(db, "courses"), {
+          await saveCourseAudienceCopies(null, {
             title,
             description,
             grade: gradeValue,
@@ -1863,17 +1918,28 @@ async function handleSubmit(event) {
           && Number(chapter.number) === number
           && chapter.type === type);
         if (duplicate) throw new Error("يوجد فصل بهذا الترتيب والنوع بالفعل.");
-        const chapterData = { number, title, type };
+        const existingChapter = state.chapters.find((item) => item.id === state.editingChapterId);
+        const chapterData = {
+          ...(existingChapter || {}),
+          number,
+          title,
+          type,
+          courseId: state.selectedCourse.id,
+          grade: state.selectedCourse.grade,
+          track: state.selectedCourse.track,
+          audienceKeys: state.selectedCourse.audienceKeys || courseAudienceKeys(state.selectedCourse),
+        };
+        delete chapterData.id;
         if (state.editingChapterId) {
-          const existingChapter = state.chapters.find((item) => item.id === state.editingChapterId);
-          const update = Number(existingChapter?.number) === number
-            ? chapterData
-            : { ...chapterData, sortOrder: number };
-          await updateDoc(doc(db, "chapters", state.editingChapterId), update);
+          if (!existingChapter) throw new Error("تعذر العثور على الفصل المطلوب تعديله.");
+          if (Number(existingChapter.number) !== number) chapterData.sortOrder = number;
+          await saveEducationRecord("chapters", existingChapter, chapterData);
           state.notice = "تم تحديث الفصل.";
         } else {
-          await addDoc(collection(db, "chapters"), {
-            ...chapterData,
+          await saveEducationRecord("chapters", null, {
+            number,
+            title,
+            type,
             sortOrder: number,
             courseId: state.selectedCourse.id,
             grade: state.selectedCourse.grade,
@@ -1897,6 +1963,7 @@ async function handleSubmit(event) {
         if (!["lesson", "exam"].includes(String(data.type))) throw new Error("اختر نوع محتوى صحيحاً.");
         const chapter = state.chapters.find((item) => item.id === data.chapterId);
         if (!chapter) throw new Error("اختر فصلاً صحيحاً.");
+        const existingLesson = state.lessons.find((item) => item.id === state.editingLessonId);
         const payload = {
           courseId: state.selectedCourse.id,
           chapterId: chapter.id,
@@ -1908,16 +1975,18 @@ async function handleSubmit(event) {
           title,
           type: data.type,
           entries,
-          sortOrder: Number(data.sortOrder || Date.now()),
+          sortOrder: existingLesson
+            ? Number(existingLesson.sortOrder ?? Date.now())
+            : Date.now(),
         };
         if (state.editingLessonId) {
-          await updateDoc(doc(db, "lessons", state.editingLessonId), payload);
+          if (!existingLesson) throw new Error("تعذر العثور على المحتوى المطلوب تعديله.");
+          await saveEducationRecord("lessons", existingLesson, payload);
           notify("تم تحديث المحتوى بنجاح.");
         } else {
-          await addDoc(collection(db, "lessons"), {
+          await saveEducationRecord("lessons", null, {
             ...payload,
             createdAt: serverTimestamp(),
-            sortOrder: Number(Date.now()),
           });
           notify("تمت إضافة المحتوى بنجاح.");
         }
