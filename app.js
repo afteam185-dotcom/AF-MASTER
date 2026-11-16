@@ -115,6 +115,8 @@ const state = {
 
 const unsubscribers = new Map();
 let sharedDataSubscriptionKey = null;
+let lessonSubscriptionCourseId = null;
+let lessonSubscriptionVersion = 0;
 let announcementExpiryTimer = null;
 let chatExpiryTimer = null;
 let supportReplyTimer = null;
@@ -511,6 +513,8 @@ function clearSubscriptions() {
   for (const unsubscribe of unsubscribers.values()) unsubscribe();
   unsubscribers.clear();
   sharedDataSubscriptionKey = null;
+  lessonSubscriptionCourseId = null;
+  lessonSubscriptionVersion += 1;
   window.clearTimeout(announcementExpiryTimer);
   window.clearTimeout(chatExpiryTimer);
   window.clearTimeout(supportReplyTimer);
@@ -832,6 +836,8 @@ async function markAnnouncementsSeen() {
 
 function listenLessons(course) {
   if (!course) {
+    lessonSubscriptionCourseId = null;
+    lessonSubscriptionVersion += 1;
     state.chapters = [];
     state.lessons = [];
     for (const key of ["chapters", "lessons"]) {
@@ -840,6 +846,11 @@ function listenLessons(course) {
     }
     return;
   }
+  if (lessonSubscriptionCourseId === course.id
+    && unsubscribers.has("chapters")
+    && unsubscribers.has("lessons")) return;
+  lessonSubscriptionCourseId = course.id;
+  const subscriptionVersion = ++lessonSubscriptionVersion;
   state.chapters = [];
   state.lessons = [];
   const audienceKey = !state.admin && state.profile ? currentAudienceKey(state.profile) : "";
@@ -850,9 +861,11 @@ function listenLessons(course) {
     ? query(collection(db, "lessons"), where("courseId", "==", course.id))
     : collection(db, "studentCatalog", audienceKey, "courses", course.id, "lessons");
   listen("chapters", chapterQuery, (snapshot) => {
+    if (lessonSubscriptionCourseId !== course.id || lessonSubscriptionVersion !== subscriptionVersion) return;
     state.chapters = snapshot.docs
       .map((item) => ({ id: item.id, ...item.data() }))
-      .sort((a, b) => Number(a.number) - Number(b.number)
+      .sort((a, b) => Number(a.sortOrder ?? a.number) - Number(b.sortOrder ?? b.number)
+        || Number(a.number) - Number(b.number)
         || Number(a.type === "exam") - Number(b.type === "exam"));
     if (state.admin) {
       const currentCourse = state.courses.find((item) => item.id === course.id);
@@ -865,7 +878,11 @@ function listenLessons(course) {
     render();
   });
   listen("lessons", lessonQuery, (snapshot) => {
+    if (lessonSubscriptionCourseId !== course.id || lessonSubscriptionVersion !== subscriptionVersion) return;
     state.lessons = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+    if (state.selectedLesson) {
+      state.selectedLesson = state.lessons.find((item) => item.id === state.selectedLesson.id) || null;
+    }
     if (state.admin) {
       const currentCourse = state.courses.find((item) => item.id === course.id);
       if (currentCourse) {
@@ -900,8 +917,18 @@ function sortCourseLessons() {
     if (orderA !== orderB) return orderA - orderB;
     const createdA = a.createdAt?.toMillis?.() || 0;
     const createdB = b.createdAt?.toMillis?.() || 0;
-    return createdA - createdB;
+    return createdA - createdB || String(a.id).localeCompare(String(b.id));
   });
+}
+
+async function saveEducationOrder(collectionName, items) {
+  for (let offset = 0; offset < items.length; offset += 450) {
+    const batch = writeBatch(db);
+    for (const [index, item] of items.slice(offset, offset + 450).entries()) {
+      batch.update(doc(db, collectionName, item.id), { sortOrder: offset + index });
+    }
+    await batch.commit();
+  }
 }
 
 function listenChat(preserveMessages = false) {
@@ -1397,16 +1424,19 @@ function chapterGroups() {
     legacyGroups.get(key).lessons.push(lesson);
   }
   return [...groups, ...legacyGroups.values()]
-    .sort((a, b) => a.number - b.number || a.title.localeCompare(b.title));
+    .sort((a, b) => Number(a.sortOrder ?? a.number) - Number(b.sortOrder ?? b.number)
+      || a.number - b.number
+      || a.title.localeCompare(b.title));
 }
 
 function learningView() {
   if (state.selectedLesson) return lessonView();
   if (state.selectedCourse) {
     const groups = chapterGroups();
+    const managedGroups = groups.filter((chapter) => !chapter.isLegacy);
     return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-courses">كل المنصات</button> ← <b>${h(state.selectedCourse.title)}</b></div>
       <div class="page-title-row course-title-row"><div><span class="eyebrow">${h(courseFilterLabel(state.selectedCourse.grade))} · ${h(courseFilterLabel(state.selectedCourse.track))}</span><h1>${h(state.selectedCourse.title)}</h1><p>${h(state.selectedCourse.description || "اختار الفصل أو المحتوى اللي حابب تراجعه.")}</p></div>${state.admin ? `<div class="course-title-actions"><button class="button button-outline" data-action="edit-course">تعديل المنصة</button><button class="button button-outline course-delete-button" data-action="delete-course" ${state.busy ? "disabled" : ""}>حذف المنصة</button><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>` : ""}</div>
-      ${groups.length ? `<div class="chapter-list">${groups.map((chapter, chapterIndex) => `<section class="chapter-card"><div class="chapter-title"><span class="chapter-index">${chapter.type === "exam" ? "E" : String(chapter.number || chapterIndex + 1).padStart(2, "0")}</span><div><span class="eyebrow">${chapter.type === "exam" ? "امتحانات" : `الفصل ${chapter.number || chapterIndex + 1}`}</span><h2>${h(chapter.title)}</h2></div><span class="chapter-count">${chapter.lessons.length} محتوى</span>${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-edit" data-action="edit-chapter" data-chapter="${h(chapter.id)}">تعديل الفصل</button><button class="text-button danger" data-action="delete-chapter" data-chapter="${h(chapter.id)}">حذف الفصل</button>` : ""}</div><div class="chapter-lessons">${chapter.lessons.map((lesson, index) => `<div class="lesson-row-wrap"><button class="lesson-row" data-lesson="${h(lesson.id)}"><span class="lesson-index ${lesson.type === "exam" ? "exam-index" : ""}">${lesson.type === "exam" ? "▣" : String(index + 1).padStart(2, "0")}</span><span class="lesson-row-copy"><b>${h(lesson.title)}</b><small>${lesson.type === "exam" ? "امتحان ومراجعة" : `${lesson.entries?.length || 0} سؤال وإجابة`}</small></span><span>←</span></button>${state.admin ? `<div class="lesson-tools"><button class="text-button" data-action="move-lesson-up" data-lesson="${h(lesson.id)}">↑</button><button class="text-button" data-action="move-lesson-down" data-lesson="${h(lesson.id)}">↓</button><button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل</button><button class="text-button danger" data-action="delete-lesson" data-lesson="${h(lesson.id)}">حذف</button></div>` : ""}</div>`).join("")}${chapter.lessons.length ? "" : `<p class="chapter-empty">لا توجد دروس في هذا الفصل بعد.</p>`}${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-add-lesson" data-action="add-lesson" data-chapter="${h(chapter.id)}">＋ إضافة درس أو امتحان لهذا الفصل</button>` : ""}</div></section>`).join("")}</div>` : emptyState("▤", "لم تُضف فصولاً بعد", "أنشئ فصول المنصة ثم أضف الدروس والامتحانات داخل كل فصل.", state.admin ? `<button class="button button-primary" data-action="add-chapter">＋ إضافة أول فصل</button>` : "")}</div>`;
+      ${groups.length ? `<div class="chapter-list">${groups.map((chapter, chapterIndex) => `<section class="chapter-card"><div class="chapter-title"><span class="chapter-index">${chapter.type === "exam" ? "E" : String(chapter.number || chapterIndex + 1).padStart(2, "0")}</span><div><span class="eyebrow">${chapter.type === "exam" ? "امتحانات" : `الفصل ${chapter.number || chapterIndex + 1}`}</span><h2>${h(chapter.title)}</h2></div><span class="chapter-count">${chapter.lessons.length} محتوى</span>${state.admin && !chapter.isLegacy ? `<button class="text-button" data-action="move-chapter-up" data-chapter="${h(chapter.id)}" ${managedGroups.findIndex((item) => item.id === chapter.id) === 0 || state.busy ? "disabled" : ""}>↑</button><button class="text-button" data-action="move-chapter-down" data-chapter="${h(chapter.id)}" ${managedGroups.findIndex((item) => item.id === chapter.id) === managedGroups.length - 1 || state.busy ? "disabled" : ""}>↓</button><button class="text-button chapter-edit" data-action="edit-chapter" data-chapter="${h(chapter.id)}">تعديل الفصل</button><button class="text-button danger" data-action="delete-chapter" data-chapter="${h(chapter.id)}">حذف الفصل</button>` : ""}</div><div class="chapter-lessons">${chapter.lessons.map((lesson, index) => `<div class="lesson-row-wrap"><button class="lesson-row" data-lesson="${h(lesson.id)}"><span class="lesson-index ${lesson.type === "exam" ? "exam-index" : ""}">${lesson.type === "exam" ? "▣" : String(index + 1).padStart(2, "0")}</span><span class="lesson-row-copy"><b>${h(lesson.title)}</b><small>${lesson.type === "exam" ? "امتحان ومراجعة" : `${lesson.entries?.length || 0} سؤال وإجابة`}</small></span><span>←</span></button>${state.admin ? `<div class="lesson-tools"><button class="text-button" data-action="move-lesson-up" data-lesson="${h(lesson.id)}" ${state.busy ? "disabled" : ""}>↑</button><button class="text-button" data-action="move-lesson-down" data-lesson="${h(lesson.id)}" ${state.busy ? "disabled" : ""}>↓</button><button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل</button><button class="text-button danger" data-action="delete-lesson" data-lesson="${h(lesson.id)}">حذف</button></div>` : ""}</div>`).join("")}${chapter.lessons.length ? "" : `<p class="chapter-empty">لا توجد دروس في هذا الفصل بعد.</p>`}${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-add-lesson" data-action="add-lesson" data-chapter="${h(chapter.id)}">＋ إضافة درس أو امتحان لهذا الفصل</button>` : ""}</div></section>`).join("")}</div>` : emptyState("▤", "لم تُضف فصولاً بعد", "أنشئ فصول المنصة ثم أضف الدروس والامتحانات داخل كل فصل.", state.admin ? `<button class="button button-primary" data-action="add-chapter">＋ إضافة أول فصل</button>` : "")}</div>`;
   }
   return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>اختار منصتك وابدأ</h1><p>محتوى مرتب حسب الصف والمسار الدراسي.</p></div>${state.admin ? `<button class="button button-primary" data-action="add-course">＋ إضافة منصة</button>` : ""}</div>
     ${state.admin ? "" : `<div class="filter-chips"><span class="filter-chip">⌂ ${h(state.profile.grade)}</span><span class="filter-chip">${h(state.profile.track)}</span></div>`}
@@ -1415,24 +1445,16 @@ function learningView() {
 }
 
 function lessonView() {
-  const lesson = state.selectedLesson;
+  const lesson = state.lessons.find((item) => item.id === state.selectedLesson?.id)
+    || state.selectedLesson;
   const chapter = state.chapters.find((item) => item.id === lesson.chapterId)
     || state.chapters.find((item) =>
       Number(item.number) === Number(lesson.chapterNumber)
       && (item.type === (lesson.type === "exam" ? "exam" : "chapter") || item.type === "chapter"));
-  if (lesson.type === "exam" && state.examLessonId !== lesson.id) {
-    state.examEntries = [...(lesson.entries || [])];
-    for (let index = state.examEntries.length - 1; index > 0; index -= 1) {
-      const swap = Math.floor(Math.random() * (index + 1));
-      [state.examEntries[index], state.examEntries[swap]] = [state.examEntries[swap], state.examEntries[index]];
-    }
-    state.examLessonId = lesson.id;
-  }
-  const entries = lesson.type === "exam" ? state.examEntries : (lesson.entries || []);
+  const entries = lesson.entries || [];
   const position = state.lessons.findIndex((item) => item.id === lesson.id);
   return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-lessons">${h(state.selectedCourse?.title || "")}</button> ← <b>${h(lesson.title)}</b>${state.admin ? `<button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل الدرس</button>` : ""}</div>
     <div class="lesson-heading"><div class="lesson-symbol">▤</div><div><span class="eyebrow">${lesson.type === "exam" ? "مراجعة واختبار" : h(chapter?.title || lesson.chapterTitle || `الفصل ${lesson.chapterNumber}`)}</span><h1>${h(lesson.title)}</h1></div><span class="pill">${entries.length} سؤال</span></div>
-    ${lesson.type === "exam" ? `<div class="exam-note">✦ قد تظهر الأسئلة بترتيب مختلف في الامتحان. راجع كل إجابة جيداً.</div>` : ""}
     <div class="qa-list">${entries.map((entry, index) => `<article class="qa-card"><div class="qa-number">س${String(index + 1).padStart(2, "0")}</div><div class="qa-body"><h3>${h(entry.question)}</h3><div class="answer-box"><span>الإجابة</span><p>${h(entry.answer)}</p></div></div><button class="copy-button" data-copy="${h(entry.answer)}"><span>▣</span><span>نسخ</span></button></article>`).join("")}</div>
     <div class="lesson-next"><span>✓✓ ${position === state.lessons.length - 1 ? "أنهيت آخر محتوى في هذه المنصة" : "أحسنت! أكملت هذا المحتوى"}</span><button class="button button-primary" data-action="next-lesson">${position === state.lessons.length - 1 ? "إنهاء" : "التالي"} ←</button></div></div>`;
 }
@@ -1559,13 +1581,13 @@ function modalView() {
     const courseFilters = courseAudienceFilters(editing ? course : { grade: grades, track: [tracks[0]] });
     const selectedGrades = courseFilters.grades;
     const selectedTracks = courseFilters.tracks;
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل المنصة" : "إضافة منصة جديدة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><form class="form-grid" data-form="course"><label>اسم المنصة<input name="title" required value="${editing ? h(course.title) : ""}" placeholder="مثال: منصة الرياضيات"></label><label>وصف مختصر<input name="description" value="${editing ? h(course.description || "") : ""}" placeholder="محتوى المنصة"></label><div class="multi-check-list"><label>الصفوف المتاحة</label><div class="check-grid">${grades.map((grade) => `<label class="check-item"><input type="checkbox" name="grade" value="${h(grade)}" ${selectedGrades.includes(grade) ? "checked" : ""}> <span>${h(grade)}</span></label>`).join("")}</div></div><div class="multi-check-list"><label>المسارات المتاحة</label><div class="check-grid">${courseTrackOptions.map((track) => `<label class="check-item"><input type="checkbox" name="track" value="${h(track)}" ${selectedTracks.includes(track) ? "checked" : ""}> <span>${h(track)}</span></label>`).join("")}</div></div><button class="button button-primary">${editing ? "حفظ التعديلات" : "＋ إضافة المنصة"}</button></form></section></div>`;
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل المنصة" : "إضافة منصة جديدة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><form class="form-grid" data-form="course"><label>اسم المنصة<input name="title" required value="${editing ? h(course.title) : ""}" placeholder="مثال: منصة الرياضيات"></label><label>وصف مختصر<input name="description" value="${editing ? h(course.description || "") : ""}" placeholder="محتوى المنصة"></label><div class="multi-check-list"><label>الصفوف المتاحة</label><div class="check-grid">${grades.map((grade) => `<label class="check-item"><input type="checkbox" name="grade" value="${h(grade)}" ${selectedGrades.includes(grade) ? "checked" : ""}> <span>${h(grade)}</span></label>`).join("")}</div></div><div class="multi-check-list"><label>المسارات المتاحة</label><div class="check-grid">${courseTrackOptions.map((track) => `<label class="check-item"><input type="checkbox" name="track" value="${h(track)}" ${selectedTracks.includes(track) ? "checked" : ""}> <span>${h(track)}</span></label>`).join("")}</div></div><button class="button button-primary" ${state.busy ? "disabled" : ""}>${editing ? "حفظ التعديلات" : "＋ إضافة المنصة"}</button></form></section></div>`;
   }
   if (state.modal === "chapter") {
     const chapter = state.chapters.find((item) => item.id === state.editingChapterId);
     const editing = Boolean(chapter);
     const nextNumber = Math.max(0, ...state.chapters.map((item) => Number(item.number) || 0)) + 1;
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل الفصل" : "إضافة فصل للمنصة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${h(state.selectedCourse?.title || "")}</p><form class="form-grid" data-form="chapter"><div class="form-row"><label>الترتيب<input name="number" type="number" min="1" value="${editing ? h(chapter.number) : nextNumber}" required></label><label>نوع الفصل<select name="type"><option value="chapter" ${editing && chapter.type === "exam" ? "" : "selected"}>فصل دراسي</option><option value="exam" ${editing && chapter.type === "exam" ? "selected" : ""}>قسم الامتحانات</option></select></label></div><label>اسم الفصل / القسم<input name="title" required maxlength="100" value="${editing ? h(chapter.title) : ""}" placeholder="${editing && chapter.type === "exam" ? "الامتحانات" : "مثال: Chapter 1 — الحركة"}"></label><button class="button button-primary">${editing ? "حفظ الفصل" : "＋ إضافة الفصل"}</button></form></section></div>`;
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل الفصل" : "إضافة فصل للمنصة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${h(state.selectedCourse?.title || "")}</p><form class="form-grid" data-form="chapter"><div class="form-row"><label>الترتيب<input name="number" type="number" min="1" value="${editing ? h(chapter.number) : nextNumber}" required></label><label>نوع الفصل<select name="type"><option value="chapter" ${editing && chapter.type === "exam" ? "" : "selected"}>فصل دراسي</option><option value="exam" ${editing && chapter.type === "exam" ? "selected" : ""}>قسم الامتحانات</option></select></label></div><label>اسم الفصل / القسم<input name="title" required maxlength="100" value="${editing ? h(chapter.title) : ""}" placeholder="${editing && chapter.type === "exam" ? "الامتحانات" : "مثال: Chapter 1 — الحركة"}"></label><button class="button button-primary" ${state.busy ? "disabled" : ""}>${editing ? "حفظ الفصل" : "＋ إضافة الفصل"}</button></form></section></div>`;
   }
   if (state.modal === "lesson") {
     const lesson = state.lessons.find((item) => item.id === state.editingLessonId) || null;
@@ -1579,7 +1601,7 @@ function modalView() {
       <label>الفصل<select name="chapterId" required>${state.chapters.map((chapter) => `<option value="${h(chapter.id)}" ${chapterId === chapter.id ? "selected" : ""}>${h(chapter.title)}</option>`).join("")}</select></label>
       <label>اسم الدرس / الامتحان<input name="title" required placeholder="مثال: الدرس الأول" value="${h(titleValue)}"></label><label>نوع المحتوى<select name="type"><option value="lesson" ${typeValue === "lesson" ? "selected" : ""}>درس</option><option value="exam" ${typeValue === "exam" ? "selected" : ""}>امتحان</option></select></label>
       <div class="question-fields">${Array.from({ length: inputCount }, (_, index) => questionFields(index, entries[index]?.question || "", entries[index]?.answer || "")).join("")}</div>
-      <button type="button" class="text-button" data-action="add-question" ${inputCount >= MAX_LESSON_QUESTIONS ? "disabled" : ""}>＋ إضافة سؤال</button><button class="button button-primary">${lesson ? "حفظ التعديلات" : "حفظ المحتوى"}</button></form>` : `<div class="empty-state"><p>أنشئ فصلاً أولاً، ثم أضف الدروس والامتحانات بداخله.</p><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>`}</section></div>`;
+      <button type="button" class="text-button" data-action="add-question" ${inputCount >= MAX_LESSON_QUESTIONS || state.busy ? "disabled" : ""}>＋ إضافة سؤال</button><button class="button button-primary" ${state.busy ? "disabled" : ""}>${lesson ? "حفظ التعديلات" : "حفظ المحتوى"}</button></form>` : `<div class="empty-state"><p>أنشئ فصلاً أولاً، ثم أضف الدروس والامتحانات بداخله.</p><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>`}</section></div>`;
   }
   return "";
 }
@@ -1618,6 +1640,7 @@ async function handleSubmit(event) {
   const form = event.target.closest("form[data-form]");
   if (!form) return;
   event.preventDefault();
+  if (state.busy && ["course", "chapter", "lesson"].includes(form.dataset.form)) return;
   const data = currentFormData(form);
   state.busy = true;
   state.error = "";
@@ -1851,11 +1874,16 @@ async function handleSubmit(event) {
         if (duplicate) throw new Error("يوجد فصل بهذا الترتيب والنوع بالفعل.");
         const chapterData = { number, title, type };
         if (state.editingChapterId) {
-          await updateDoc(doc(db, "chapters", state.editingChapterId), chapterData);
+          const existingChapter = state.chapters.find((item) => item.id === state.editingChapterId);
+          const update = Number(existingChapter?.number) === number
+            ? chapterData
+            : { ...chapterData, sortOrder: number };
+          await updateDoc(doc(db, "chapters", state.editingChapterId), update);
           state.notice = "تم تحديث الفصل.";
         } else {
           await addDoc(collection(db, "chapters"), {
             ...chapterData,
+            sortOrder: number,
             courseId: state.selectedCourse.id,
             grade: state.selectedCourse.grade,
             track: state.selectedCourse.track,
@@ -2109,6 +2137,47 @@ async function deleteLessonAndAudienceCopies(lessonId) {
   await batch.commit();
 }
 
+function lessonChapterKey(lesson) {
+  const number = Number(lesson.chapterNumber || 0);
+  const type = lesson.type === "exam" ? "exam" : "chapter";
+  const chapter = state.chapters.find((item) => item.id === lesson.chapterId)
+    || state.chapters.find((item) => Number(item.number) === number && item.type === type)
+    || state.chapters.find((item) => Number(item.number) === number && item.type === "chapter");
+  return chapter ? chapter.id : `legacy:${number}`;
+}
+
+async function moveEducationItem(action, itemId) {
+  if (!state.admin || state.busy) return;
+  const movingUp = action.endsWith("-up");
+  const isChapter = action.startsWith("move-chapter-");
+  const selectedLesson = isChapter ? null : state.lessons.find((item) => item.id === itemId);
+  if (!isChapter && !selectedLesson) return;
+  const items = isChapter
+    ? state.chapters.slice().sort((a, b) =>
+      Number(a.sortOrder ?? a.number) - Number(b.sortOrder ?? b.number)
+      || Number(a.number) - Number(b.number)
+      || String(a.title).localeCompare(String(b.title)))
+    : state.lessons.filter((lesson) => lessonChapterKey(lesson) === lessonChapterKey(selectedLesson));
+  const index = items.findIndex((item) => item.id === itemId);
+  const targetIndex = index + (movingUp ? -1 : 1);
+  if (index < 0 || targetIndex < 0 || targetIndex >= items.length) return;
+  [items[index], items[targetIndex]] = [items[targetIndex], items[index]];
+
+  state.busy = true;
+  state.error = "";
+  render();
+  try {
+    await saveEducationOrder(isChapter ? "chapters" : "lessons", items);
+    notify(isChapter ? "تم تحديث ترتيب الفصول." : "تم تحديث ترتيب الدروس.");
+  } catch (error) {
+    console.error(`Could not reorder education ${isChapter ? "chapter" : "lesson"} ${itemId}.`, error);
+    fail(error);
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
 async function clickAction(action, target, originalTarget) {
   switch (action) {
     case "google-login":
@@ -2280,28 +2349,12 @@ async function clickAction(action, target, originalTarget) {
         notify("تم حذف الدرس.");
       } catch (error) { fail(error); }
       break;
+    case "move-chapter-up":
+    case "move-chapter-down":
     case "move-lesson-up":
     case "move-lesson-down": {
-      if (!state.admin || !target.dataset.lesson) break;
-      const lessonId = target.dataset.lesson;
-      const sortedLessons = [...state.lessons].sort((a, b) => {
-        const rankA = Number(a.sortOrder ?? a.createdAt?.toMillis?.() ?? 0);
-        const rankB = Number(b.sortOrder ?? b.createdAt?.toMillis?.() ?? 0);
-        return rankA - rankB;
-      });
-      const index = sortedLessons.findIndex((lesson) => lesson.id === lessonId);
-      if (index < 0) break;
-      const targetIndex = action === "move-lesson-up" ? index - 1 : index + 1;
-      if (targetIndex < 0 || targetIndex >= sortedLessons.length) break;
-      const current = sortedLessons[index];
-      const swap = sortedLessons[targetIndex];
-      const currentOrder = Number(current.sortOrder ?? current.createdAt?.toMillis?.() ?? 0);
-      const swapOrder = Number(swap.sortOrder ?? swap.createdAt?.toMillis?.() ?? 0);
-      await Promise.all([
-        updateDoc(doc(db, "lessons", current.id), { sortOrder: swapOrder }),
-        updateDoc(doc(db, "lessons", swap.id), { sortOrder: currentOrder }),
-      ]);
-      notify("تم تحديث ترتيب الدروس.");
+      const itemId = target.dataset.chapter || target.dataset.lesson;
+      if (itemId) await moveEducationItem(action, itemId);
       break;
     }
     case "close-modal":
@@ -2373,7 +2426,7 @@ async function clickAction(action, target, originalTarget) {
       break;
     }
     case "back-courses":
-      state.selectedCourse = null; state.selectedChapterId = ""; state.selectedLesson = null; state.examLessonId = ""; listenLessons(null); render(); break;
+      state.selectedCourse = null; state.selectedChapterId = ""; state.selectedLesson = null; listenLessons(null); render(); break;
     case "back-lessons": state.selectedLesson = null; render(); break;
     case "next-lesson": {
       const index = state.lessons.findIndex((lesson) => lesson.id === state.selectedLesson?.id);
@@ -2485,14 +2538,12 @@ async function handleClick(event) {
   if (courseButton) {
     state.selectedCourse = state.courses.find((course) => course.id === courseButton.dataset.course) || null;
     state.selectedChapterId = "";
-    state.examLessonId = "";
     navigateTo("learning");
     return;
   }
   const lessonButton = event.target.closest(".lesson-row[data-lesson]");
   if (lessonButton) {
     state.selectedLesson = state.lessons.find((lesson) => lesson.id === lessonButton.dataset.lesson) || null;
-    state.examLessonId = "";
     render();
     return;
   }
