@@ -64,6 +64,7 @@ const introMessage = document.querySelector("#intro-message");
 const grades = ["الأول الثانوي", "الثاني الثانوي", "الثالث الثانوي"];
 const tracks = ["عربي", "لغات"];
 const courseTrackOptions = ["عربي", "لغات", "كلاهما"];
+const MAX_LESSON_QUESTIONS = 100;
 const state = {
   user: null,
   profile: null,
@@ -332,22 +333,34 @@ function courseFilterLabel(value) {
   return values.join(" / ");
 }
 
+function courseAudienceFilters(course) {
+  const allowedGrades = normalizeCourseFilterValues(course.grade).filter((grade) => grades.includes(grade));
+  const allowedTracks = normalizeCourseFilterValues(course.track)
+    .filter((track) => courseTrackOptions.includes(track));
+  return {
+    grades: allowedGrades.length ? allowedGrades : grades,
+    tracks: allowedTracks.length ? allowedTracks : ["كلاهما"],
+  };
+}
+
 function courseMatchesProfile(course) {
   const currentProfile = state.profile;
   if (!currentProfile) return true;
-  const allowedGrades = normalizeCourseFilterValues(course?.grade);
-  const allowedTracks = normalizeCourseFilterValues(course?.track);
-  const gradeMatch = !allowedGrades.length || allowedGrades.includes(currentProfile.grade);
-  const trackMatch = !allowedTracks.length || allowedTracks.includes(currentProfile.track) || allowedTracks.includes("كلاهما");
+  const filters = courseAudienceFilters(course || {});
+  const gradeMatch = filters.grades.includes(currentProfile.grade);
+  const trackMatch = filters.tracks.includes(currentProfile.track) || filters.tracks.includes("كلاهما");
   return gradeMatch && trackMatch;
 }
 
 function courseAudienceKeys(course) {
-  const allowedGrades = normalizeCourseFilterValues(course.grade);
-  const allowedTracks = normalizeCourseFilterValues(course.track);
-  const expandedTracks = allowedTracks.includes("كلاهما") ? tracks : allowedTracks;
-  return allowedGrades.flatMap((grade) =>
+  const filters = courseAudienceFilters(course);
+  const expandedTracks = filters.tracks.includes("كلاهما") ? tracks : filters.tracks;
+  return filters.grades.flatMap((grade) =>
     expandedTracks.map((track) => `${grade}|${track}`));
+}
+
+function allAudienceKeys() {
+  return grades.flatMap((grade) => tracks.map((track) => `${grade}|${track}`));
 }
 
 function currentAudienceKey(profile) {
@@ -490,7 +503,8 @@ function learnCatalogCount() {
 }
 
 function studentCommunityCount() {
-  return Math.max(0, Number(state.studentCount) || 0) * 3;
+  const studentCount = Number(state.studentCount);
+  return (Number.isFinite(studentCount) ? Math.max(0, Math.floor(studentCount)) : 0) * 3;
 }
 
 function clearSubscriptions() {
@@ -841,8 +855,11 @@ function listenLessons(course) {
       .sort((a, b) => Number(a.number) - Number(b.number)
         || Number(a.type === "exam") - Number(b.type === "exam"));
     if (state.admin) {
-      syncAudienceItems(course, "chapters", snapshot.docs).catch(fail);
-      migrateCourseAudience(course);
+      const currentCourse = state.courses.find((item) => item.id === course.id);
+      if (currentCourse) {
+        syncAudienceItems(currentCourse, "chapters", snapshot.docs).catch(fail);
+        migrateCourseAudience(currentCourse);
+      }
     }
     sortCourseLessons();
     render();
@@ -850,8 +867,11 @@ function listenLessons(course) {
   listen("lessons", lessonQuery, (snapshot) => {
     state.lessons = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
     if (state.admin) {
-      syncAudienceItems(course, "lessons", snapshot.docs).catch(fail);
-      migrateCourseAudience(course);
+      const currentCourse = state.courses.find((item) => item.id === course.id);
+      if (currentCourse) {
+        syncAudienceItems(currentCourse, "lessons", snapshot.docs).catch(fail);
+        migrateCourseAudience(currentCourse);
+      }
     }
     sortCourseLessons();
     render();
@@ -1326,12 +1346,13 @@ function dashboardView() {
   const preview = state.courses.slice(0, 2);
   const courseCountValue = state.admin ? (state.courses.length || 0) : learnCatalogCount();
   const studentCrowdValue = studentCommunityCount();
+  const studentCrowdDisplay = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(studentCrowdValue);
   return `<div class="dashboard-page"><div class="welcome-banner"><div class="welcome-content"><span class="eyebrow"><span class="online-dot"></span> منصتك التعليمية في مكان واحد</span>
     <h1>${state.admin ? "أهلاً بك في لوحة الإشراف" : `أهلاً يا ${h(firstName)}،<br>جاهز لخطوتك الجاية؟`}</h1>
     <p>${state.admin ? "أدر المحتوى وتابع الطلاب من مكان واحد." : "اختار درس النهاردة وخلي هدفك أقرب."}</p>
     ${state.admin ? "" : `<button class="button button-light" data-nav="learning">ابدأ التعلّم ←</button>`}</div>
     <div class="welcome-art" aria-hidden="true"><div class="art-ring ring-a"></div><div class="art-ring ring-b"></div><div class="art-book">▤</div><div class="art-star star-a">✦</div><div class="art-star star-b">✧</div><div class="art-dot"></div></div><div class="banner-grain"></div></div>
-    <div class="stat-grid">${statCard("▤", "المنصات المتاحة", String(courseCountValue).padStart(2, "0"), state.admin ? "في مكتبة المحتوى" : "متاحة للطلاب", "cyan")}${statCard("▧", "إعلانات جديدة", String(state.announcements.length).padStart(2, "0"), "من فريق الإشراف", "purple")}${statCard("◌", state.admin ? "أجهزة المشرف النشطة" : "طلابنا", state.admin ? String(state.adminDeviceCount) : String(studentCrowdValue), state.admin ? "بلا حد أقصى" : "3× العدد الحقيقي", "blue")}</div>
+    <div class="stat-grid">${statCard("▤", "المنصات المتاحة", String(courseCountValue).padStart(2, "0"), state.admin ? "في مكتبة المحتوى" : "متاحة للطلاب", "cyan")}${statCard("▧", "إعلانات جديدة", String(state.announcements.length).padStart(2, "0"), "من فريق الإشراف", "purple")}${statCard("◌", state.admin ? "أجهزة المشرف النشطة" : "طلاب مجتمعنا", state.admin ? String(state.adminDeviceCount) : studentCrowdDisplay, state.admin ? "بلا حد أقصى" : "في AF MASTER", "blue")}</div>
     ${state.admin ? "" : `${state.warnings.length ? `<section class="panel warning-panel"><div class="panel-heading"><div><span class="eyebrow">تنبيه من الإشراف</span><h2>ملاحظات على حسابك</h2></div></div>${state.warnings.map((warning) => `<article class="warning-row"><b>${h(warning.body)}</b><small>${h(timestampText(warning.createdAt, true))}</small></article>`).join("")}</section>` : ""}
     <div class="dashboard-columns"><section class="panel learning-panel"><div class="panel-heading"><div><span class="eyebrow">مساحة التعلّم</span><h2>منصاتك الدراسية</h2></div><button class="text-button" data-nav="learning">عرض الكل ←</button></div>
     ${preview.length ? `<div class="course-mini-grid">${preview.map(courseCard).join("")}</div>` : emptyState("▤", "لسه مفيش منصات", "سيظهر محتوى صفك هنا بمجرد إضافته من المشرف.")}</section>
@@ -1385,7 +1406,7 @@ function learningView() {
     const groups = chapterGroups();
     return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-courses">كل المنصات</button> ← <b>${h(state.selectedCourse.title)}</b></div>
       <div class="page-title-row course-title-row"><div><span class="eyebrow">${h(courseFilterLabel(state.selectedCourse.grade))} · ${h(courseFilterLabel(state.selectedCourse.track))}</span><h1>${h(state.selectedCourse.title)}</h1><p>${h(state.selectedCourse.description || "اختار الفصل أو المحتوى اللي حابب تراجعه.")}</p></div>${state.admin ? `<div class="course-title-actions"><button class="button button-outline" data-action="edit-course">تعديل المنصة</button><button class="button button-outline course-delete-button" data-action="delete-course" ${state.busy ? "disabled" : ""}>حذف المنصة</button><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>` : ""}</div>
-      ${groups.length ? `<div class="chapter-list">${groups.map((chapter, chapterIndex) => `<section class="chapter-card"><div class="chapter-title"><span class="chapter-index">${chapter.type === "exam" ? "E" : String(chapter.number || chapterIndex + 1).padStart(2, "0")}</span><div><span class="eyebrow">${chapter.type === "exam" ? "امتحانات" : `الفصل ${chapter.number || chapterIndex + 1}`}</span><h2>${h(chapter.title)}</h2></div><span class="chapter-count">${chapter.lessons.length} محتوى</span>${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-edit" data-action="edit-chapter" data-chapter="${h(chapter.id)}">تعديل الفصل</button>` : ""}</div><div class="chapter-lessons">${chapter.lessons.map((lesson, index) => `<div class="lesson-row-wrap"><button class="lesson-row" data-lesson="${h(lesson.id)}"><span class="lesson-index ${lesson.type === "exam" ? "exam-index" : ""}">${lesson.type === "exam" ? "▣" : String(index + 1).padStart(2, "0")}</span><span class="lesson-row-copy"><b>${h(lesson.title)}</b><small>${lesson.type === "exam" ? "امتحان ومراجعة" : `${lesson.entries?.length || 0} سؤال وإجابة`}</small></span><span>←</span></button>${state.admin ? `<div class="lesson-tools"><button class="text-button" data-action="move-lesson-up" data-lesson="${h(lesson.id)}">↑</button><button class="text-button" data-action="move-lesson-down" data-lesson="${h(lesson.id)}">↓</button><button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل</button><button class="text-button danger" data-action="delete-lesson" data-lesson="${h(lesson.id)}">حذف</button></div>` : ""}</div>`).join("")}${chapter.lessons.length ? "" : `<p class="chapter-empty">لا توجد دروس في هذا الفصل بعد.</p>`}${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-add-lesson" data-action="add-lesson" data-chapter="${h(chapter.id)}">＋ إضافة درس أو امتحان لهذا الفصل</button>` : ""}</div></section>`).join("")}</div>` : emptyState("▤", "لم تُضف فصولاً بعد", "أنشئ فصول المنصة ثم أضف الدروس والامتحانات داخل كل فصل.", state.admin ? `<button class="button button-primary" data-action="add-chapter">＋ إضافة أول فصل</button>` : "")}</div>`;
+      ${groups.length ? `<div class="chapter-list">${groups.map((chapter, chapterIndex) => `<section class="chapter-card"><div class="chapter-title"><span class="chapter-index">${chapter.type === "exam" ? "E" : String(chapter.number || chapterIndex + 1).padStart(2, "0")}</span><div><span class="eyebrow">${chapter.type === "exam" ? "امتحانات" : `الفصل ${chapter.number || chapterIndex + 1}`}</span><h2>${h(chapter.title)}</h2></div><span class="chapter-count">${chapter.lessons.length} محتوى</span>${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-edit" data-action="edit-chapter" data-chapter="${h(chapter.id)}">تعديل الفصل</button><button class="text-button danger" data-action="delete-chapter" data-chapter="${h(chapter.id)}">حذف الفصل</button>` : ""}</div><div class="chapter-lessons">${chapter.lessons.map((lesson, index) => `<div class="lesson-row-wrap"><button class="lesson-row" data-lesson="${h(lesson.id)}"><span class="lesson-index ${lesson.type === "exam" ? "exam-index" : ""}">${lesson.type === "exam" ? "▣" : String(index + 1).padStart(2, "0")}</span><span class="lesson-row-copy"><b>${h(lesson.title)}</b><small>${lesson.type === "exam" ? "امتحان ومراجعة" : `${lesson.entries?.length || 0} سؤال وإجابة`}</small></span><span>←</span></button>${state.admin ? `<div class="lesson-tools"><button class="text-button" data-action="move-lesson-up" data-lesson="${h(lesson.id)}">↑</button><button class="text-button" data-action="move-lesson-down" data-lesson="${h(lesson.id)}">↓</button><button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل</button><button class="text-button danger" data-action="delete-lesson" data-lesson="${h(lesson.id)}">حذف</button></div>` : ""}</div>`).join("")}${chapter.lessons.length ? "" : `<p class="chapter-empty">لا توجد دروس في هذا الفصل بعد.</p>`}${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-add-lesson" data-action="add-lesson" data-chapter="${h(chapter.id)}">＋ إضافة درس أو امتحان لهذا الفصل</button>` : ""}</div></section>`).join("")}</div>` : emptyState("▤", "لم تُضف فصولاً بعد", "أنشئ فصول المنصة ثم أضف الدروس والامتحانات داخل كل فصل.", state.admin ? `<button class="button button-primary" data-action="add-chapter">＋ إضافة أول فصل</button>` : "")}</div>`;
   }
   return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>اختار منصتك وابدأ</h1><p>محتوى مرتب حسب الصف والمسار الدراسي.</p></div>${state.admin ? `<button class="button button-primary" data-action="add-course">＋ إضافة منصة</button>` : ""}</div>
     ${state.admin ? "" : `<div class="filter-chips"><span class="filter-chip">⌂ ${h(state.profile.grade)}</span><span class="filter-chip">${h(state.profile.track)}</span></div>`}
@@ -1535,8 +1556,9 @@ function modalView() {
   if (state.modal === "course") {
     const course = state.courses.find((item) => item.id === state.editingCourseId) || state.selectedCourse;
     const editing = Boolean(state.editingCourseId && course);
-    const selectedGrades = normalizeCourseFilterValues(editing ? course.grade : grades);
-    const selectedTracks = normalizeCourseFilterValues(editing ? course.track : [tracks[0]]);
+    const courseFilters = courseAudienceFilters(editing ? course : { grade: grades, track: [tracks[0]] });
+    const selectedGrades = courseFilters.grades;
+    const selectedTracks = courseFilters.tracks;
     return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل المنصة" : "إضافة منصة جديدة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><form class="form-grid" data-form="course"><label>اسم المنصة<input name="title" required value="${editing ? h(course.title) : ""}" placeholder="مثال: منصة الرياضيات"></label><label>وصف مختصر<input name="description" value="${editing ? h(course.description || "") : ""}" placeholder="محتوى المنصة"></label><div class="multi-check-list"><label>الصفوف المتاحة</label><div class="check-grid">${grades.map((grade) => `<label class="check-item"><input type="checkbox" name="grade" value="${h(grade)}" ${selectedGrades.includes(grade) ? "checked" : ""}> <span>${h(grade)}</span></label>`).join("")}</div></div><div class="multi-check-list"><label>المسارات المتاحة</label><div class="check-grid">${courseTrackOptions.map((track) => `<label class="check-item"><input type="checkbox" name="track" value="${h(track)}" ${selectedTracks.includes(track) ? "checked" : ""}> <span>${h(track)}</span></label>`).join("")}</div></div><button class="button button-primary">${editing ? "حفظ التعديلات" : "＋ إضافة المنصة"}</button></form></section></div>`;
   }
   if (state.modal === "chapter") {
@@ -1552,18 +1574,28 @@ function modalView() {
     const titleValue = lesson?.title || "";
     const typeValue = lesson?.type || "lesson";
     const entries = lesson?.entries || [];
-    const inputCount = Math.max(3, entries.length || 3);
+    const inputCount = Math.min(MAX_LESSON_QUESTIONS, Math.max(3, entries.length || 3));
     return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${lesson ? "تعديل درس أو امتحان" : "إضافة درس أو امتحان"}</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${h(state.selectedCourse?.title || "")}</p>${state.chapters.length ? `<form class="form-grid lesson-form" data-form="lesson">
       <label>الفصل<select name="chapterId" required>${state.chapters.map((chapter) => `<option value="${h(chapter.id)}" ${chapterId === chapter.id ? "selected" : ""}>${h(chapter.title)}</option>`).join("")}</select></label>
       <label>اسم الدرس / الامتحان<input name="title" required placeholder="مثال: الدرس الأول" value="${h(titleValue)}"></label><label>نوع المحتوى<select name="type"><option value="lesson" ${typeValue === "lesson" ? "selected" : ""}>درس</option><option value="exam" ${typeValue === "exam" ? "selected" : ""}>امتحان</option></select></label>
       <div class="question-fields">${Array.from({ length: inputCount }, (_, index) => questionFields(index, entries[index]?.question || "", entries[index]?.answer || "")).join("")}</div>
-      <button type="button" class="text-button" data-action="add-question">＋ إضافة سؤال</button><button class="button button-primary">${lesson ? "حفظ التعديلات" : "حفظ المحتوى"}</button></form>` : `<div class="empty-state"><p>أنشئ فصلاً أولاً، ثم أضف الدروس والامتحانات بداخله.</p><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>`}</section></div>`;
+      <button type="button" class="text-button" data-action="add-question" ${inputCount >= MAX_LESSON_QUESTIONS ? "disabled" : ""}>＋ إضافة سؤال</button><button class="button button-primary">${lesson ? "حفظ التعديلات" : "حفظ المحتوى"}</button></form>` : `<div class="empty-state"><p>أنشئ فصلاً أولاً، ثم أضف الدروس والامتحانات بداخله.</p><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>`}</section></div>`;
   }
   return "";
 }
 
 function questionFields(index, question = "", answer = "") {
   return `<div class="question-entry"><b>سؤال ${index + 1}</b><label>السؤال<textarea name="question-${index}" rows="2" ${index === 0 ? "required" : ""} placeholder="اكتب السؤال...">${h(question)}</textarea></label><label>الإجابة<textarea name="answer-${index}" rows="2" ${index === 0 ? "required" : ""} placeholder="اكتب الإجابة...">${h(answer)}</textarea></label></div>`;
+}
+
+function lessonEntriesFromForm(data) {
+  const entries = [];
+  for (let index = 0; index < MAX_LESSON_QUESTIONS; index += 1) {
+    const question = String(data[`question-${index}`] || "").trim();
+    const answer = String(data[`answer-${index}`] || "").trim();
+    if (question && answer) entries.push({ question, answer });
+  }
+  return entries;
 }
 
 function currentFormData(form) {
@@ -1839,12 +1871,7 @@ async function handleSubmit(event) {
         break;
       }
       case "lesson": {
-        const entries = [];
-        for (let index = 0; index < 8; index += 1) {
-          const question = String(data[`question-${index}`] || "").trim();
-          const answer = String(data[`answer-${index}`] || "").trim();
-          if (question && answer) entries.push({ question, answer });
-        }
+        const entries = lessonEntriesFromForm(data);
         if (!entries.length) throw new Error("أضف سؤالاً وإجابة واحدة على الأقل.");
         const title = String(data.title || "").trim();
         if (!title) throw new Error("اكتب اسم الدرس أو الامتحان.");
@@ -1992,24 +2019,75 @@ async function enableStudentCodeLogin() {
 
 async function deleteCourseAndContent(course) {
   const courseId = course.id;
-  const [chapterSnapshot, lessonSnapshot] = await Promise.all([
+  const audienceKeys = allAudienceKeys();
+  const [chapterSnapshot, lessonSnapshot, audienceSnapshots] = await Promise.all([
     getDocs(query(collection(db, "chapters"), where("courseId", "==", courseId))),
     getDocs(query(collection(db, "lessons"), where("courseId", "==", courseId))),
+    Promise.all(audienceKeys.map(async (audienceKey) => {
+      const courseRef = audienceCourseRef(audienceKey, courseId);
+      const [chapters, lessons] = await Promise.all([
+        getDocs(collection(courseRef, "chapters")),
+        getDocs(collection(courseRef, "lessons")),
+      ]);
+      return { courseRef, chapters, lessons };
+    })),
   ]);
   const contentRefs = [
-    doc(db, "courses", courseId),
     ...chapterSnapshot.docs.map((item) => item.ref),
     ...lessonSnapshot.docs.map((item) => item.ref),
+    ...audienceSnapshots.flatMap(({ chapters, lessons }) => [
+      ...chapters.docs.map((item) => item.ref),
+      ...lessons.docs.map((item) => item.ref),
+    ]),
   ];
-  for (const audienceKey of courseAudienceKeys(course)) {
-    contentRefs.push(audienceCourseRef(audienceKey, courseId));
-    for (const chapter of chapterSnapshot.docs) {
-      contentRefs.push(audienceContentRef(audienceKey, courseId, "chapters", chapter.id));
+  for (let offset = 0; offset < contentRefs.length; offset += 450) {
+    const batch = writeBatch(db);
+    for (const contentRef of contentRefs.slice(offset, offset + 450)) {
+      batch.delete(contentRef);
     }
-    for (const lesson of lessonSnapshot.docs) {
-      contentRefs.push(audienceContentRef(audienceKey, courseId, "lessons", lesson.id));
-    }
+    await batch.commit();
   }
+  const batch = writeBatch(db);
+  batch.delete(doc(db, "courses", courseId));
+  for (const { courseRef } of audienceSnapshots) batch.delete(courseRef);
+  await batch.commit();
+}
+
+function lessonBelongsToChapter(lesson, chapter) {
+  if (lesson.chapterId) return lesson.chapterId === chapter.id;
+  const chapterType = chapter.type || "chapter";
+  const lessonChapterType = lesson.type === "exam" ? "exam" : "chapter";
+  return Number(lesson.chapterNumber) === Number(chapter.number)
+    && lessonChapterType === chapterType;
+}
+
+async function deleteChapterAndLessons(chapter) {
+  const courseId = state.selectedCourse?.id;
+  if (!courseId) throw new Error("تعذر العثور على المنصة المرتبطة بهذا الفصل.");
+  const audienceKeys = allAudienceKeys();
+  const [lessonSnapshot, audienceSnapshots] = await Promise.all([
+    getDocs(query(collection(db, "lessons"), where("courseId", "==", courseId))),
+    Promise.all(audienceKeys.map(async (audienceKey) => {
+      const courseRef = audienceCourseRef(audienceKey, courseId);
+      const [chapters, lessons] = await Promise.all([
+        getDocs(collection(courseRef, "chapters")),
+        getDocs(collection(courseRef, "lessons")),
+      ]);
+      return { chapters, lessons };
+    })),
+  ]);
+  const lessonDocs = lessonSnapshot.docs.filter((item) => lessonBelongsToChapter(item.data(), chapter));
+  const copiedLessonRefs = audienceSnapshots.flatMap(({ lessons }) =>
+    lessons.docs
+      .filter((item) => lessonBelongsToChapter(item.data(), chapter))
+      .map((item) => item.ref));
+  const contentRefs = [
+    ...lessonDocs.map((item) => item.ref),
+    ...copiedLessonRefs,
+    ...audienceKeys.map((audienceKey) =>
+      audienceContentRef(audienceKey, courseId, "chapters", chapter.id)),
+    doc(db, "chapters", chapter.id),
+  ];
   for (let offset = 0; offset < contentRefs.length; offset += 450) {
     const batch = writeBatch(db);
     for (const contentRef of contentRefs.slice(offset, offset + 450)) {
@@ -2022,7 +2100,7 @@ async function deleteCourseAndContent(course) {
 async function deleteLessonAndAudienceCopies(lessonId) {
   const lesson = state.lessons.find((item) => item.id === lessonId);
   if (!lesson) throw new Error("تعذر العثور على الدرس المطلوب حذفه.");
-  const audienceKeys = courseAudienceKeys(state.selectedCourse || lesson);
+  const audienceKeys = allAudienceKeys();
   const batch = writeBatch(db);
   batch.delete(doc(db, "lessons", lessonId));
   for (const audienceKey of audienceKeys) {
@@ -2169,6 +2247,24 @@ async function clickAction(action, target, originalTarget) {
       state.modal = "chapter";
       render();
       break;
+    case "delete-chapter": {
+      if (!state.admin || !state.selectedCourse) break;
+      const chapter = state.chapters.find((item) => item.id === target.dataset.chapter);
+      if (!chapter) break;
+      if (!window.confirm(`سيتم حذف الفصل "${chapter.title}" وجميع محتوياته. هل تريد المتابعة؟`)) break;
+      try {
+        await deleteChapterAndLessons(chapter);
+        state.selectedChapterId = "";
+        if (state.selectedLesson && lessonBelongsToChapter(state.selectedLesson, chapter)) {
+          state.selectedLesson = null;
+        }
+        notify("تم حذف الفصل ومحتوياته.");
+      } catch (error) {
+        console.error(`Could not delete chapter ${chapter.id}.`, error);
+        fail(error);
+      }
+      break;
+    }
     case "edit-lesson":
       if (!state.admin || !target.dataset.lesson) break;
       state.editingLessonId = target.dataset.lesson;
@@ -2270,7 +2366,10 @@ async function clickAction(action, target, originalTarget) {
       const form = target.closest("form");
       const fields = form.querySelector(".question-fields");
       const count = fields.querySelectorAll(".question-entry").length;
-      if (count < 8) fields.insertAdjacentHTML("beforeend", questionFields(count));
+      if (count < MAX_LESSON_QUESTIONS) {
+        fields.insertAdjacentHTML("beforeend", questionFields(count));
+        if (count + 1 === MAX_LESSON_QUESTIONS) target.disabled = true;
+      }
       break;
     }
     case "back-courses":

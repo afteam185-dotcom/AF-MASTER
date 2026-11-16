@@ -22,15 +22,19 @@ service cloud.firestore {
       return hasActiveProfile();
     }
     function matchesCourseGrade(course, student) {
-      return course.keys().hasAny(['grade'])
-        && (course.grade == student.grade
-          || (course.grade is list && course.grade.hasAny([student.grade])));
+      return !course.keys().hasAny(['grade'])
+        || (course.grade is string && course.grade.size() == 0)
+        || (course.grade is list && course.grade.size() == 0)
+        || course.grade == student.grade
+        || (course.grade is list && course.grade.hasAny([student.grade]));
     }
     function matchesCourseTrack(course, student) {
-      return course.keys().hasAny(['track'])
-        && (course.track == student.track
-          || course.track == 'كلاهما'
-          || (course.track is list && course.track.hasAny([student.track, 'كلاهما'])));
+      return !course.keys().hasAny(['track'])
+        || (course.track is string && course.track.size() == 0)
+        || (course.track is list && course.track.size() == 0)
+        || course.track == student.track
+        || course.track == 'كلاهما'
+        || (course.track is list && course.track.hasAny([student.track, 'كلاهما']));
     }
     function matchesCourseAudience(course, student) {
       return course.keys().hasAny(['audienceKeys'])
