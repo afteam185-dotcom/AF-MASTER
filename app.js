@@ -65,7 +65,6 @@ const grades = ["الأول الثانوي", "الثاني الثانوي", "ا�
 const tracks = ["عربي", "لغات"];
 const courseTrackOptions = ["عربي", "لغات", "كلاهما"];
 const MAX_LESSON_QUESTIONS = 100;
-const LOCAL_COURSE_TITLE = "Qureo JavaScript";
 const state = {
   user: null,
   profile: null,
@@ -84,8 +83,6 @@ const state = {
   nav: "home",
   navHistory: [],
   courses: [],
-  remoteCourses: [],
-  localCourses: [],
   groupChatLocked: false,
   catalogCount: 0,
   studentCount: 0,
@@ -123,8 +120,6 @@ const state = {
 };
 
 const unsubscribers = new Map();
-let localCourseDataPromise = null;
-let localCourseDataLoaded = false;
 const localLessonTranslations = new Map();
 let localArabicEnglishTranslatorPromise = null;
 let sharedDataSubscriptionKey = null;
@@ -146,31 +141,6 @@ function h(value) {
     '"': "&quot;",
     "'": "&#39;",
   })[character]);
-}
-
-function loadLocalCourseData() {
-  if (!localCourseDataPromise) {
-    localCourseDataPromise = fetch(new URL("./local-courses.json", import.meta.url))
-      .then((response) => {
-        if (!response.ok) throw new Error(`تعذر تحميل بيانات المنصات المحلية (${response.status}).`);
-        return response.json();
-      })
-      .then((courses) => {
-        if (!Array.isArray(courses) || courses.some((course) =>
-          !course.id
-          || course.title !== LOCAL_COURSE_TITLE
-          || !course.grade
-          || !Array.isArray(course.chapters))) {
-          throw new Error("ملف المنصات المحلية غير صالح.");
-        }
-        return courses.map((course) => ({ ...course, local: true }));
-      })
-      .catch((error) => {
-        localCourseDataPromise = null;
-        throw error;
-      });
-  }
-  return localCourseDataPromise;
 }
 
 function latinDigits(value) {
@@ -388,13 +358,6 @@ function courseAudienceKeys(course) {
   const expandedTracks = filters.tracks.includes("كلاهما") ? tracks : filters.tracks;
   return filters.grades.flatMap((grade) =>
     expandedTracks.map((track) => `${grade}|${track}`));
-}
-
-function localCourseVisible(course) {
-  if (state.admin) return true;
-  const filters = courseAudienceFilters(course);
-  return filters.grades.includes(state.profile?.grade)
-    && (filters.tracks.includes(state.profile?.track) || filters.tracks.includes("كلاهما"));
 }
 
 function canTranslateLesson(lesson) {
@@ -992,7 +955,6 @@ function listenSharedData() {
   sharedDataSubscriptionKey = subscriptionKey;
   if (!state.admin && (!state.profile || !state.profile.isActive)) {
     state.courses = [];
-    state.remoteCourses = [];
     state.catalogCount = 0;
     state.studentCount = 0;
     state.announcements = [];
@@ -1016,14 +978,10 @@ function listenSharedData() {
   const updateCourses = (records) => {
     const sortedRecords = records.slice().sort((a, b) =>
       (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
-    state.remoteCourses = sortedRecords;
-    state.courses = [
-      ...sortedRecords,
-      ...state.localCourses.filter(localCourseVisible),
-    ];
+    state.courses = sortedRecords;
     if (state.admin) {
-      state.catalogCount = records.length + (localCourseDataLoaded ? state.localCourses.length : 0);
-      if (localCourseDataLoaded) syncPublicStats();
+      state.catalogCount = records.length;
+      syncPublicStats();
     }
     if (state.selectedCourse) {
       const previousCourse = state.selectedCourse;
@@ -1046,32 +1004,15 @@ function listenSharedData() {
     }
     render();
   };
-  if (!localCourseDataLoaded) {
-    const activeUid = state.user.uid;
-    loadLocalCourseData().then((courses) => {
-      localCourseDataLoaded = true;
-      state.localCourses = courses;
-      if (state.user?.uid === activeUid) updateCourses(state.remoteCourses);
-    }).catch((error) => {
-      console.error("Could not load local platform data.", error);
-      fail(error);
-    });
-  }
   if (state.admin) {
-    listen("courses", query(
-      collection(db, "courses"),
-      where("title", "!=", LOCAL_COURSE_TITLE),
-    ), (snapshot) => {
+    listen("courses", query(collection(db, "courses")), (snapshot) => {
       const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
       records.forEach((course) => migrateCourseAudience(course));
       updateCourses(records);
     });
   } else {
     const audienceKey = currentAudienceKey(state.profile);
-    listen("courses-student", query(
-      collection(db, "studentCatalog", audienceKey, "courses"),
-      where("title", "!=", LOCAL_COURSE_TITLE),
-    ), (snapshot) => {
+    listen("courses-student", collection(db, "studentCatalog", audienceKey, "courses"), (snapshot) => {
       updateCourses(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
     });
   }
@@ -1120,28 +1061,6 @@ function listenLessons(course) {
       unsubscribers.get(key)?.();
       unsubscribers.delete(key);
     }
-    return;
-  }
-  if (course.local) {
-    lessonSubscriptionCourseId = course.id;
-    lessonSubscriptionVersion += 1;
-    for (const key of ["chapters", "lessons"]) {
-      unsubscribers.get(key)?.();
-      unsubscribers.delete(key);
-    }
-    state.chapters = (course.chapters || []).map((chapter) => ({ ...chapter }));
-    state.lessons = state.chapters.flatMap((chapter) =>
-      (chapter.lessons || []).map((lesson) => ({
-        ...lesson,
-        courseId: course.id,
-        chapterId: lesson.chapterId || chapter.id,
-        chapterNumber: lesson.chapterNumber ?? chapter.number,
-        chapterTitle: lesson.chapterTitle || chapter.title,
-        grade: course.grade,
-        track: course.track,
-      })));
-    sortCourseLessons();
-    render();
     return;
   }
   if (lessonSubscriptionCourseId === course.id
@@ -1495,7 +1414,6 @@ onAuthStateChanged(auth, async (user) => {
   state.deviceError = "";
   state.admin = false;
   state.courses = [];
-  state.remoteCourses = [];
   state.chapters = [];
   state.lessons = [];
   state.selectedCourse = null;
@@ -1755,8 +1673,8 @@ function learningView() {
     const groups = chapterGroups();
     const managedGroups = groups.filter((chapter) => !chapter.isLegacy);
     return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-courses">كل المنصات</button> ← <b>${h(state.selectedCourse.title)}</b></div>
-      <div class="page-title-row course-title-row"><div><span class="eyebrow">${h(courseFilterLabel(state.selectedCourse.grade))} · ${h(courseFilterLabel(state.selectedCourse.track))}</span><h1>${h(state.selectedCourse.title)}</h1><p>${h(state.selectedCourse.description || "اختار الفصل أو المحتوى اللي حابب تراجعه.")}</p></div>${state.admin && !state.selectedCourse.local ? `<div class="course-title-actions"><button class="button button-outline" data-action="edit-course">تعديل المنصة</button><button class="button button-outline course-delete-button" data-action="delete-course" ${state.busy ? "disabled" : ""}>حذف المنصة</button><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>` : ""}</div>
-      ${groups.length ? `<div class="chapter-list">${groups.map((chapter, chapterIndex) => `<section class="chapter-card"><div class="chapter-title"><span class="chapter-index">${chapter.type === "exam" ? "E" : String(chapter.number || chapterIndex + 1).padStart(2, "0")}</span><div><span class="eyebrow">${chapter.type === "exam" ? "امتحانات" : `الفصل ${chapter.number || chapterIndex + 1}`}</span><h2>${h(chapter.title)}</h2></div><span class="chapter-count">${chapter.lessons.length} محتوى</span>${state.admin && !state.selectedCourse.local && !chapter.isLegacy ? `<button class="text-button" data-action="move-chapter-up" data-chapter="${h(chapter.id)}" ${managedGroups.findIndex((item) => item.id === chapter.id) === 0 || state.busy ? "disabled" : ""}>↑</button><button class="text-button" data-action="move-chapter-down" data-chapter="${h(chapter.id)}" ${managedGroups.findIndex((item) => item.id === chapter.id) === managedGroups.length - 1 || state.busy ? "disabled" : ""}>↓</button><button class="text-button chapter-edit" data-action="edit-chapter" data-chapter="${h(chapter.id)}">تعديل الفصل</button><button class="text-button danger" data-action="delete-chapter" data-chapter="${h(chapter.id)}">حذف الفصل</button>` : ""}</div><div class="chapter-lessons">${chapter.lessons.map((lesson, index) => `<div class="lesson-row-wrap"><button class="lesson-row" data-lesson="${h(lesson.id)}"><span class="lesson-index ${lesson.type === "exam" ? "exam-index" : ""}">${lesson.type === "exam" ? "▣" : String(index + 1).padStart(2, "0")}</span><span class="lesson-row-copy"><b>${h(lesson.title)}</b><small>${lesson.type === "exam" ? "امتحان ومراجعة" : `${lesson.entries?.length || 0} سؤال وإجابة`}</small></span><span>←</span></button>${state.admin && !state.selectedCourse.local ? `<div class="lesson-tools"><button class="text-button" data-action="move-lesson-up" data-lesson="${h(lesson.id)}" ${state.busy ? "disabled" : ""}>↑</button><button class="text-button" data-action="move-lesson-down" data-lesson="${h(lesson.id)}" ${state.busy ? "disabled" : ""}>↓</button><button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل</button><button class="text-button danger" data-action="delete-lesson" data-lesson="${h(lesson.id)}">حذف</button></div>` : ""}</div>`).join("")}${chapter.lessons.length ? "" : `<p class="chapter-empty">لا توجد دروس في هذا الفصل بعد.</p>`}${state.admin && !state.selectedCourse.local && !chapter.isLegacy ? `<button class="text-button chapter-add-lesson" data-action="add-lesson" data-chapter="${h(chapter.id)}">＋ إضافة درس أو امتحان لهذا الفصل</button>` : ""}</div></section>`).join("")}</div>` : emptyState("▤", "لم تُضف فصولاً بعد", "أنشئ فصول المنصة ثم أضف الدروس والامتحانات داخل كل فصل.", state.admin && !state.selectedCourse.local ? `<button class="button button-primary" data-action="add-chapter">＋ إضافة أول فصل</button>` : "")}</div>`;
+      <div class="page-title-row course-title-row"><div><span class="eyebrow">${h(courseFilterLabel(state.selectedCourse.grade))} · ${h(courseFilterLabel(state.selectedCourse.track))}</span><h1>${h(state.selectedCourse.title)}</h1><p>${h(state.selectedCourse.description || "اختار الفصل أو المحتوى اللي حابب تراجعه.")}</p></div>${state.admin ? `<div class="course-title-actions"><button class="button button-outline" data-action="edit-course">تعديل المنصة</button><button class="button button-outline course-delete-button" data-action="delete-course" ${state.busy ? "disabled" : ""}>حذف المنصة</button><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>` : ""}</div>
+      ${groups.length ? `<div class="chapter-list">${groups.map((chapter, chapterIndex) => `<section class="chapter-card"><div class="chapter-title"><span class="chapter-index">${chapter.type === "exam" ? "E" : String(chapter.number || chapterIndex + 1).padStart(2, "0")}</span><div><span class="eyebrow">${chapter.type === "exam" ? "امتحانات" : `الفصل ${chapter.number || chapterIndex + 1}`}</span><h2>${h(chapter.title)}</h2></div><span class="chapter-count">${chapter.lessons.length} محتوى</span>${state.admin && !chapter.isLegacy ? `<button class="text-button" data-action="move-chapter-up" data-chapter="${h(chapter.id)}" ${managedGroups.findIndex((item) => item.id === chapter.id) === 0 || state.busy ? "disabled" : ""}>↑</button><button class="text-button" data-action="move-chapter-down" data-chapter="${h(chapter.id)}" ${managedGroups.findIndex((item) => item.id === chapter.id) === managedGroups.length - 1 || state.busy ? "disabled" : ""}>↓</button><button class="text-button chapter-edit" data-action="edit-chapter" data-chapter="${h(chapter.id)}">تعديل الفصل</button><button class="text-button danger" data-action="delete-chapter" data-chapter="${h(chapter.id)}">حذف الفصل</button>` : ""}</div><div class="chapter-lessons">${chapter.lessons.map((lesson, index) => `<div class="lesson-row-wrap"><button class="lesson-row" data-lesson="${h(lesson.id)}"><span class="lesson-index ${lesson.type === "exam" ? "exam-index" : ""}">${lesson.type === "exam" ? "▣" : String(index + 1).padStart(2, "0")}</span><span class="lesson-row-copy"><b>${h(lesson.title)}</b><small>${lesson.type === "exam" ? "امتحان ومراجعة" : `${lesson.entries?.length || 0} سؤال وإجابة`}</small></span><span>←</span></button>${state.admin ? `<div class="lesson-tools"><button class="text-button" data-action="move-lesson-up" data-lesson="${h(lesson.id)}" ${state.busy ? "disabled" : ""}>↑</button><button class="text-button" data-action="move-lesson-down" data-lesson="${h(lesson.id)}" ${state.busy ? "disabled" : ""}>↓</button><button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل</button><button class="text-button danger" data-action="delete-lesson" data-lesson="${h(lesson.id)}">حذف</button></div>` : ""}</div>`).join("")}${chapter.lessons.length ? "" : `<p class="chapter-empty">لا توجد دروس في هذا الفصل بعد.</p>`}${state.admin && !chapter.isLegacy ? `<button class="text-button chapter-add-lesson" data-action="add-lesson" data-chapter="${h(chapter.id)}">＋ إضافة درس أو امتحان لهذا الفصل</button>` : ""}</div></section>`).join("")}</div>` : emptyState("▤", "لم تُضف فصولاً بعد", "أنشئ فصول المنصة ثم أضف الدروس والامتحانات داخل كل فصل.", state.admin ? `<button class="button button-primary" data-action="add-chapter">＋ إضافة أول فصل</button>` : "")}</div>`;
   }
   return `<div class="learning-page"><div class="page-title-row"><div><span class="eyebrow">مكتبتك التعليمية</span><h1>اختار منصتك وابدأ</h1><p>محتوى مرتب حسب الصف والمسار الدراسي.</p></div>${state.admin ? `<button class="button button-primary" data-action="add-course">＋ إضافة منصة</button>` : ""}</div>
     ${state.admin ? "" : `<div class="filter-chips"><span class="filter-chip">⌂ ${h(state.profile.grade)}</span><span class="filter-chip">${h(state.profile.track)}</span></div>`}
@@ -1781,7 +1699,7 @@ function lessonView() {
     : state.translationError
       ? `<div class="inline-error" role="alert">${h(state.translationError)}${state.translationCanRetry ? ` <button class="text-button" data-action="retry-lesson-translation">إعادة المحاولة</button>` : ""}</div>`
       : "";
-  return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-lessons">${h(state.selectedCourse?.title || "")}</button> ← <b dir="${translation ? "ltr" : "rtl"}">${h(lessonTitle)}</b>${state.admin && !state.selectedCourse?.local ? `<button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل الدرس</button>` : ""}</div>
+  return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-lessons">${h(state.selectedCourse?.title || "")}</button> ← <b dir="${translation ? "ltr" : "rtl"}">${h(lessonTitle)}</b>${state.admin ? `<button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل الدرس</button>` : ""}</div>
     ${translationStatus}
     <div class="lesson-heading"><div class="lesson-symbol">▤</div><div><span class="eyebrow" dir="${translation ? "ltr" : "rtl"}">${lesson.type === "exam" ? "مراجعة واختبار" : h(chapterTitle || `الفصل ${lesson.chapterNumber}`)}</span><h1 dir="${translation ? "ltr" : "rtl"}">${h(lessonTitle)}</h1></div><span class="pill">${entries.length} سؤال</span></div>
     <div class="qa-list">${entries.map((entry, index) => `<article class="qa-card"><div class="qa-number">س${String(index + 1).padStart(2, "0")}</div><div class="qa-body" dir="${translation ? "ltr" : "rtl"}"><h3>${h(entry.question)}</h3><div class="answer-box"><span>${translation ? "Answer" : "الإجابة"}</span><p>${h(entry.answer)}</p></div></div><button class="copy-button" data-copy="${h(entry.answer)}"><span>▣</span><span>نسخ</span></button></article>`).join("")}</div>
@@ -2532,20 +2450,6 @@ async function moveEducationItem(action, itemId) {
 }
 
 async function clickAction(action, target, originalTarget) {
-  if (state.selectedCourse?.local && [
-    "edit-course",
-    "delete-course",
-    "add-chapter",
-    "edit-chapter",
-    "delete-chapter",
-    "add-lesson",
-    "edit-lesson",
-    "delete-lesson",
-    "move-chapter-up",
-    "move-chapter-down",
-    "move-lesson-up",
-    "move-lesson-down",
-  ].includes(action)) return;
   switch (action) {
     case "google-login":
       await loginWithGoogle();
