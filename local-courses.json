@@ -1,0 +1,74 @@
+[
+  {
+    "id": "local-qureo-javascript-grade-1",
+    "title": "Qureo JavaScript",
+    "grade": "الأول الثانوي",
+    "track": "كلاهما",
+    "description": "بيانات محلية تجريبية قابلة للتعديل في local-courses.json.",
+    "link": "",
+    "translationEnabled": true,
+    "chapters": [
+      {
+        "id": "local-qureo-grade-1-chapter-1",
+        "number": 1,
+        "sortOrder": 1,
+        "title": "مقدمة إلى JavaScript",
+        "type": "chapter",
+        "lessons": [
+          {
+            "id": "local-qureo-grade-1-lesson-1",
+            "title": "المتغيرات وطباعة القيم",
+            "type": "lesson",
+            "sortOrder": 1,
+            "entries": [
+              {
+                "question": "ما وظيفة console.log() في JavaScript؟",
+                "answer": "تُستخدم لعرض قيمة أو رسالة في وحدة التحكم. مثال: console.log('Hello');"
+              },
+              {
+                "question": "كيف نعرّف ثابتاً لا نعيد إسناد قيمة جديدة إليه؟",
+                "answer": "نستخدم const، مثل: const score = 10;"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "local-qureo-javascript-grade-2",
+    "title": "Qureo JavaScript",
+    "grade": "الثاني الثانوي",
+    "track": "كلاهما",
+    "description": "بيانات محلية تجريبية قابلة للتعديل في local-courses.json.",
+    "link": "",
+    "translationEnabled": true,
+    "chapters": [
+      {
+        "id": "local-qureo-grade-2-chapter-1",
+        "number": 1,
+        "sortOrder": 1,
+        "title": "الشروط والتكرار",
+        "type": "chapter",
+        "lessons": [
+          {
+            "id": "local-qureo-grade-2-lesson-1",
+            "title": "الشروط والحلقات",
+            "type": "lesson",
+            "sortOrder": 1,
+            "entries": [
+              {
+                "question": "متى يُنفّذ كود جملة if؟",
+                "answer": "يُنفّذ عندما يكون الشرط صحيحاً. مثال: if (score >= 50) { console.log('Pass'); }"
+              },
+              {
+                "question": "ما فائدة حلقة for؟",
+                "answer": "تكرّر تنفيذ كتلة من الأوامر عدداً محدداً من المرات. مثال: for (let i = 0; i < 3; i++) { console.log(i); }"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]

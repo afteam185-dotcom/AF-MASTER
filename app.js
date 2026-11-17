@@ -150,7 +150,7 @@ function h(value) {
 
 function loadLocalCourseData() {
   if (!localCourseDataPromise) {
-    localCourseDataPromise = fetch(new URL("./data/local-courses.json", import.meta.url))
+    localCourseDataPromise = fetch(new URL("./local-courses.json", import.meta.url))
       .then((response) => {
         if (!response.ok) throw new Error(`تعذر تحميل بيانات المنصات المحلية (${response.status}).`);
         return response.json();
