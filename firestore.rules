@@ -1,0 +1,595 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.firebase.sign_in_provider == 'google.com'
+        && request.auth.uid in [
+          'J9BuDGBCXTced8WtkJsjDQUw94g2',
+          'BrequkkRPuRVaLgmlN8i8tMmN7I2',
+          'ePEzd3F1BNXJvwteHU2TqTYshMq2'  
+        ];
+    }
+    function hasActiveProfile() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/profiles/$(request.auth.uid))
+        && get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.isActive == true;
+    }
+    function hasLearningAccess() {
+      return hasActiveProfile();
+    }
+    function matchesCourseGrade(course, student) {
+      return !course.keys().hasAny(['grade'])
+        || (course.grade is string && course.grade.size() == 0)
+        || (course.grade is list && course.grade.size() == 0)
+        || course.grade == student.grade
+        || (course.grade is list && course.grade.hasAny([student.grade]));
+    }
+    function matchesCourseTrack(course, student) {
+      return !course.keys().hasAny(['track'])
+        || (course.track is string && course.track.size() == 0)
+        || (course.track is list && course.track.size() == 0)
+        || course.track == student.track
+        || course.track == 'كلاهما'
+        || (course.track is list && course.track.hasAny([student.track, 'كلاهما']));
+    }
+    function matchesCourseAudience(course, student) {
+      return course.keys().hasAny(['audienceKeys'])
+        && course.audienceKeys is list
+        && course.audienceKeys.hasAny([student.grade + '|' + student.track]);
+    }
+    function matchesStudentCourse(course) {
+      let student = get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data;
+      return hasLearningAccess()
+        && (matchesCourseAudience(course, student)
+          || (matchesCourseGrade(course, student) && matchesCourseTrack(course, student)));
+    }
+    function matchesStudentAudienceKey(audienceKey) {
+      let student = get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data;
+      return audienceKey == student.grade + '|' + student.track;
+    }
+    function validStudentCounterCreate(statId) {
+      let profilePath = /databases/$(database)/documents/profiles/$(request.auth.uid);
+      return statId == 'catalog'
+        && signedIn()
+        && request.auth.token.firebase.sign_in_provider == 'google.com'
+        && request.resource.data.keys().hasOnly(['studentCount', 'updatedAt'])
+        && request.resource.data.studentCount == 1
+        && request.resource.data.updatedAt == request.time
+        && !exists(profilePath)
+        && existsAfter(profilePath)
+        && getAfter(profilePath).data.uid == request.auth.uid
+        && getAfter(profilePath).data.createdAt == request.time;
+    }
+    function validStudentCounterIncrement(statId) {
+      let profilePath = /databases/$(database)/documents/profiles/$(request.auth.uid);
+      return statId == 'catalog'
+        && signedIn()
+        && request.auth.token.firebase.sign_in_provider == 'google.com'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'studentCount', 'updatedAt'
+        ])
+        && request.resource.data.studentCount is int
+        && request.resource.data.studentCount == resource.data.get('studentCount', 0) + 1
+        && request.resource.data.updatedAt == request.time
+        && !exists(profilePath)
+        && existsAfter(profilePath)
+        && getAfter(profilePath).data.uid == request.auth.uid
+        && getAfter(profilePath).data.createdAt == request.time;
+    }
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+    function validAdminStudentStatusUpdate(uid) {
+      return isAdmin()
+        && !(uid in [
+          'J9BuDGBCXTced8WtkJsjDQUw94g2',
+          'BrequkkRPuRVaLgmlN8i8tMmN7I2',
+          'ePEzd3F1BNXJvwteHU2TqTYshMq2'
+        ])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'isActive', 'statusUpdatedAt'
+        ])
+        && request.resource.data.isActive is bool
+        && request.resource.data.statusUpdatedAt == request.time;
+    }
+    function validMessageExpiry(value) {
+      return value is timestamp
+        && value > request.time
+        && value <= request.time + duration.value(25, 'h');
+    }
+    function groupChatOpen() {
+      let settingsPath = /databases/$(database)/documents/chatSettings/group;
+      return !exists(settingsPath) || get(settingsPath).data.get('locked', false) != true;
+    }
+    function validChatMessageFields() {
+      return request.resource.data.keys().hasAll([
+          'senderId', 'senderName', 'text', 'kind', 'createdAt', 'expiresAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'senderId', 'senderName', 'text', 'kind', 'createdAt', 'expiresAt'
+        ])
+        && request.resource.data.senderId is string
+        && request.resource.data.senderName is string
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 2000
+        && request.resource.data.createdAt == request.time;
+    }
+    function validSupportMessageSummary(roomId, messageId, senderId, senderName, messageText, senderKind) {
+      return roomId.matches('^support_[A-Za-z0-9_-]+$')
+        && existsAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId))
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.senderId == senderId
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.senderName == senderName
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.text == messageText
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.kind == senderKind
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)/messages/$(messageId)).data.expiresAt == null;
+    }
+    function validChatMessage(roomId, messageId) {
+      return validChatMessageFields()
+        && (
+          (
+            isAdmin()
+            && request.resource.data.senderId == request.auth.uid
+            && request.resource.data.senderName == 'مشرف AF MASTER'
+            && request.resource.data.kind == 'admin'
+            && (
+              (
+                roomId == 'students'
+                && validMessageExpiry(request.resource.data.expiresAt)
+              )
+              || (
+                roomId.matches('^support_[A-Za-z0-9_-]+$')
+                && request.resource.data.expiresAt == null
+                && exists(/databases/$(database)/documents/chatRooms/$(roomId))
+                && roomId == 'support_' + getAfter(
+                  /databases/$(database)/documents/chatRooms/$(roomId)
+                ).data.studentUid
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.awaitingAdminReply == false
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.adminReplyAt == request.time
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.latestSenderId == request.auth.uid
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.lastMessageId == messageId
+                && validSupportMessageSummary(roomId, messageId, request.auth.uid,
+                  'مشرف AF MASTER', request.resource.data.text, 'admin')
+              )
+            )
+          )
+          || (
+            hasActiveProfile()
+            && request.resource.data.senderId == request.auth.uid
+            && request.resource.data.senderName
+              == get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.fullName
+            && request.resource.data.kind == 'student'
+            && (
+              (
+                roomId == 'students'
+                && groupChatOpen()
+                && validMessageExpiry(request.resource.data.expiresAt)
+              )
+              || (
+                roomId == 'support_' + request.auth.uid
+                && request.resource.data.expiresAt == null
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.studentUid == request.auth.uid
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.awaitingAdminReply == true
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.adminReplyAt == null
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.latestSenderId == request.auth.uid
+                && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.lastMessageId == messageId
+                && validSupportMessageSummary(roomId, messageId, request.auth.uid,
+                  get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.fullName,
+                  request.resource.data.text, 'student')
+              )
+            )
+          )
+          || (
+            hasActiveProfile()
+            && roomId == 'support_' + request.auth.uid
+            && request.resource.data.senderId == 'system'
+            && request.resource.data.senderName == 'AF MASTER'
+            && request.resource.data.text == 'تم استلام رسالتك، وسيتم الرد عليك خلال 24 ساعة.'
+            && request.resource.data.kind == 'system'
+            && request.resource.data.expiresAt == null
+            && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.studentUid == request.auth.uid
+            && getAfter(/databases/$(database)/documents/chatRooms/$(roomId)).data.awaitingAdminReply == true
+          )
+        );
+    }
+    function validSupportRoom(roomId) {
+      return request.resource.data.keys().hasAll([
+          'roomType', 'studentUid', 'updatedAt', 'awaitingAdminReply',
+          'adminReplyAt', 'latestMessage', 'latestMessageAt',
+          'latestSenderId', 'latestSenderName', 'lastMessageId'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'roomType', 'studentUid', 'updatedAt', 'awaitingAdminReply',
+          'adminReplyAt', 'latestMessage', 'latestMessageAt',
+          'latestSenderId', 'latestSenderName', 'lastMessageId'
+        ])
+        && request.resource.data.roomType == 'support'
+        && request.resource.data.studentUid is string
+        && roomId == 'support_' + request.resource.data.studentUid
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.awaitingAdminReply is bool
+        && request.resource.data.latestMessage is string
+        && request.resource.data.latestMessage.size() > 0
+        && request.resource.data.latestMessage.size() <= 2000
+        && request.resource.data.latestMessageAt == request.time
+        && (request.resource.data.adminReplyAt == null
+          || request.resource.data.adminReplyAt is timestamp)
+        && request.resource.data.latestSenderId is string
+        && request.resource.data.latestSenderName is string
+        && request.resource.data.lastMessageId is string
+        && (
+          (
+            isAdmin()
+            && exists(/databases/$(database)/documents/profiles/$(request.resource.data.studentUid))
+            && request.resource.data.awaitingAdminReply == false
+            && request.resource.data.adminReplyAt == request.time
+            && request.resource.data.latestSenderId == request.auth.uid
+            && request.resource.data.latestSenderName == 'مشرف AF MASTER'
+            && validSupportMessageSummary(roomId, request.resource.data.lastMessageId,
+              request.auth.uid, 'مشرف AF MASTER', request.resource.data.latestMessage, 'admin')
+            && (!exists(/databases/$(database)/documents/chatRooms/$(roomId))
+              || resource.data.studentUid == request.resource.data.studentUid)
+          )
+          || (
+            hasActiveProfile()
+            && request.resource.data.studentUid == request.auth.uid
+            && request.resource.data.awaitingAdminReply == true
+            && request.resource.data.adminReplyAt == null
+            && request.resource.data.latestSenderId == request.auth.uid
+            && request.resource.data.latestSenderName
+              == get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.fullName
+            && validSupportMessageSummary(roomId, request.resource.data.lastMessageId,
+              request.auth.uid, request.resource.data.latestSenderName,
+              request.resource.data.latestMessage, 'student')
+            && (!exists(/databases/$(database)/documents/chatRooms/$(roomId))
+              || resource.data.studentUid == request.auth.uid)
+          )
+        );
+    }
+    function validStudentLoginCode(uid) {
+      let code = getAfter(
+        /databases/$(database)/documents/profiles/$(uid)/privateAuth/login
+      ).data.loginCode;
+      return code is string
+        && code.matches('^[0-9]{8}$')
+        && existsAfter(/databases/$(database)/documents/loginCodes/$(code))
+        && getAfter(/databases/$(database)/documents/loginCodes/$(code)).data.uid == uid;
+    }
+    function validStudentProfile(uid) {
+      return isSelf(uid)
+        && request.auth.token.firebase.sign_in_provider == 'google.com'
+        && !(uid in [
+          'J9BuDGBCXTced8WtkJsjDQUw94g2',
+          'BrequkkRPuRVaLgmlN8i8tMmN7I2',
+          'ePEzd3F1BNXJvwteHU2TqTYshMq2'
+        ])
+        && request.resource.data.keys().hasAll([
+          'uid', 'fullName', 'normalizedName', 'email', 'phone', 'grade', 'track',
+          'studentCode', 'referredByUid', 'referralCodeUsed', 'isActive',
+          'referralCount', 'whatsappShareCount', 'whatsappChannelJoined',
+          'lastWhatsAppShareId', 'createdAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'uid', 'fullName', 'normalizedName', 'email', 'phone', 'grade', 'track',
+          'studentCode', 'referredByUid', 'referralCodeUsed', 'isActive',
+          'referralCount', 'whatsappShareCount', 'whatsappChannelJoined',
+          'lastWhatsAppShareId', 'createdAt'
+        ])
+        && request.resource.data.uid == uid
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() >= 8
+        && request.resource.data.fullName.size() <= 100
+        && request.resource.data.fullName.matches('^\\S+( \\S+){2,}$')
+        && !request.resource.data.fullName.matches('.*/.*')
+        && request.resource.data.normalizedName == request.resource.data.fullName.lower()
+        && request.resource.data.email is string
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.phone.matches('^\\+?[0-9]{8,15}$')
+        && request.resource.data.grade in ['الأول الثانوي', 'الثاني الثانوي', 'الثالث الثانوي']
+        && request.resource.data.track in ['عربي', 'لغات']
+        && request.resource.data.studentCode.matches('^AF[A-F0-9]{8}$')
+        && request.resource.data.isActive == true
+        && request.resource.data.referralCount == 0
+        && request.resource.data.whatsappShareCount == 0
+        && request.resource.data.whatsappChannelJoined == false
+        && request.resource.data.lastWhatsAppShareId == null
+        && request.resource.data.createdAt == request.time
+        && existsAfter(/databases/$(database)/documents/phoneNumbers/$(request.resource.data.phone))
+        && getAfter(/databases/$(database)/documents/phoneNumbers/$(request.resource.data.phone)).data.uid == uid
+        && existsAfter(/databases/$(database)/documents/profileNames/$(request.resource.data.normalizedName))
+        && getAfter(/databases/$(database)/documents/profileNames/$(request.resource.data.normalizedName)).data.uid == uid
+        && existsAfter(/databases/$(database)/documents/referralCodes/$(request.resource.data.studentCode))
+        && getAfter(/databases/$(database)/documents/referralCodes/$(request.resource.data.studentCode)).data.uid == uid
+        && validStudentLoginCode(uid)
+        && (
+          (request.resource.data.referredByUid == null && request.resource.data.referralCodeUsed == null)
+          || (
+            request.resource.data.referredByUid is string
+            && request.resource.data.referredByUid != uid
+            && request.resource.data.referralCodeUsed is string
+            && request.resource.data.referralCodeUsed.matches('^AF[A-F0-9]{8}$')
+            && get(/databases/$(database)/documents/referralCodes/$(request.resource.data.referralCodeUsed)).data.uid
+              == request.resource.data.referredByUid
+          )
+        );
+    }
+    function validReferralIncrement(uid) {
+      return signedIn()
+        && request.auth.uid != uid
+        && resource.data.isActive == true
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['referralCount'])
+        && request.resource.data.referralCount == resource.data.referralCount + 1
+        && existsAfter(/databases/$(database)/documents/profiles/$(uid)/referrals/$(request.auth.uid))
+        && getAfter(/databases/$(database)/documents/profiles/$(uid)/referrals/$(request.auth.uid)).data.referredUid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.referredByUid == uid
+        && getAfter(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.referralCodeUsed == resource.data.studentCode
+        && get(/databases/$(database)/documents/referralCodes/$(resource.data.studentCode)).data.uid == uid;
+    }
+    function validWhatsAppShareIncrement(uid) {
+      return isSelf(uid)
+        && resource.data.isActive == true
+        && resource.data.get('whatsappShareCount', 0) < 10
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'whatsappShareCount', 'lastWhatsAppShareId'
+        ])
+        && request.resource.data.whatsappShareCount == resource.data.get('whatsappShareCount', 0) + 1
+        && request.resource.data.lastWhatsAppShareId is string
+        && request.resource.data.lastWhatsAppShareId.matches('^[a-f0-9]{64}$')
+        && existsAfter(/databases/$(database)/documents/profiles/$(uid)/whatsappShares/$(request.resource.data.lastWhatsAppShareId))
+        && getAfter(/databases/$(database)/documents/profiles/$(uid)/whatsappShares/$(request.resource.data.lastWhatsAppShareId)).data.recipientHash
+          == request.resource.data.lastWhatsAppShareId
+        && getAfter(/databases/$(database)/documents/profiles/$(uid)/whatsappShares/$(request.resource.data.lastWhatsAppShareId)).data.createdAt
+          == request.time;
+    }
+
+    match /profiles/{uid} {
+      allow read: if isSelf(uid) || isAdmin();
+      allow create: if validStudentProfile(uid);
+      allow update: if (isSelf(uid)
+          && resource.data.isActive == true
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['grade', 'track'])
+          && request.resource.data.grade in ['الأول الثانوي', 'الثاني الثانوي', 'الثالث الثانوي']
+          && request.resource.data.track in ['عربي', 'لغات'])
+        || (isSelf(uid)
+          && resource.data.isActive == true
+          && resource.data.get('whatsappChannelJoined', false) == false
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['whatsappChannelJoined'])
+          && request.resource.data.whatsappChannelJoined == true)
+        || validReferralIncrement(uid)
+        || validWhatsAppShareIncrement(uid)
+        || validAdminStudentStatusUpdate(uid);
+      allow delete: if false;
+      match /referrals/{referralUid} {
+        allow read: if isSelf(uid) || isAdmin();
+        allow create: if signedIn()
+          && request.auth.uid == referralUid
+          && request.resource.data.keys().hasOnly(['referredUid', 'referralCode', 'createdAt'])
+          && request.resource.data.referredUid == referralUid
+          && request.resource.data.createdAt == request.time
+          && getAfter(/databases/$(database)/documents/profiles/$(referralUid)).data.referredByUid == uid
+          && getAfter(/databases/$(database)/documents/profiles/$(referralUid)).data.referralCodeUsed == request.resource.data.referralCode
+          && get(/databases/$(database)/documents/referralCodes/$(request.resource.data.referralCode)).data.uid == uid;
+        allow update, delete: if false;
+      }
+      match /warnings/{warningId} {
+        allow read: if isSelf(uid) || isAdmin();
+        allow create: if isAdmin()
+          && request.resource.data.keys().hasOnly(['body', 'createdAt', 'createdBy'])
+          && request.resource.data.body is string
+          && request.resource.data.body.size() >= 4
+          && request.resource.data.body.size() <= 500
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.createdBy == request.auth.uid;
+        allow update, delete: if false;
+      }
+      match /privateAuth/{credentialId} {
+        allow get: if isSelf(uid) && credentialId == 'login';
+        allow list: if false;
+        allow create: if isSelf(uid)
+          && credentialId == 'login'
+          && request.resource.data.keys().hasOnly(['loginCode', 'createdAt'])
+          && request.resource.data.loginCode.matches('^[0-9]{8}$')
+          && request.resource.data.createdAt == request.time;
+        allow update: if isSelf(uid)
+          && credentialId == 'login'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['loginCode'])
+          && request.resource.data.loginCode.matches('^[0-9]{8}$')
+          && existsAfter(/databases/$(database)/documents/loginCodes/$(request.resource.data.loginCode))
+          && getAfter(/databases/$(database)/documents/loginCodes/$(request.resource.data.loginCode)).data.uid == uid;
+        allow delete: if false;
+      }
+      match /whatsappShares/{shareId} {
+        allow get: if isSelf(uid) || isAdmin();
+        allow list: if false;
+        allow create: if isSelf(uid)
+          && request.resource.data.keys().hasOnly(['recipientHash', 'createdAt'])
+          && shareId.matches('^[a-f0-9]{64}$')
+          && request.resource.data.recipientHash == shareId
+          && request.resource.data.createdAt == request.time
+          && getAfter(/databases/$(database)/documents/profiles/$(uid)).data.lastWhatsAppShareId == shareId
+          && getAfter(/databases/$(database)/documents/profiles/$(uid)).data.whatsappShareCount
+            == get(/databases/$(database)/documents/profiles/$(uid)).data.get('whatsappShareCount', 0) + 1;
+        allow update, delete: if false;
+      }
+    }
+
+    match /loginCodes/{code} {
+      allow get: if isSelf(resource.data.uid);
+      allow list: if false;
+      allow create: if isSelf(request.resource.data.uid)
+        && code.matches('^[0-9]{8}$')
+        && request.resource.data.keys().hasOnly(['uid', 'createdAt'])
+        && request.resource.data.createdAt == request.time
+        && existsAfter(/databases/$(database)/documents/profiles/$(request.auth.uid)/privateAuth/login)
+        && getAfter(/databases/$(database)/documents/profiles/$(request.auth.uid)/privateAuth/login).data.loginCode == code;
+      allow update, delete: if false;
+    }
+
+    match /chapters/{chapterId} {
+      allow read: if isAdmin() || matchesStudentCourse(resource.data);
+      allow write: if isAdmin();
+    }
+
+    match /courses/{courseId} {
+      allow read: if isAdmin() || matchesStudentCourse(resource.data);
+      allow write: if isAdmin();
+    }
+    match /lessons/{lessonId} {
+      allow read: if isAdmin() || matchesStudentCourse(resource.data);
+      allow write: if isAdmin();
+    }
+    match /studentCatalog/{audienceKey}/courses/{courseId} {
+      allow read: if isAdmin()
+        || (hasLearningAccess() && matchesStudentAudienceKey(audienceKey));
+      allow write: if isAdmin();
+      match /chapters/{chapterId} {
+        allow read: if isAdmin()
+          || (hasLearningAccess() && matchesStudentAudienceKey(audienceKey));
+        allow write: if isAdmin();
+      }
+      match /lessons/{lessonId} {
+        allow read: if isAdmin()
+          || (hasLearningAccess() && matchesStudentAudienceKey(audienceKey));
+        allow write: if isAdmin();
+      }
+    }
+
+    match /chatRooms/{roomId} {
+      allow read: if isAdmin()
+        || (signedIn() && roomId == 'support_' + request.auth.uid && hasActiveProfile());
+      allow create, update: if validSupportRoom(roomId);
+      allow delete: if false;
+      match /messages/{messageId} {
+        allow read: if isAdmin()
+          || (roomId == 'support_' + request.auth.uid && hasActiveProfile())
+          || (roomId == 'students'
+            && hasActiveProfile()
+            && (resource.data.expiresAt == null || resource.data.expiresAt > request.time));
+        allow create: if validChatMessage(roomId, messageId);
+        allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expiresAt'])
+          && request.resource.data.expiresAt == null
+          && (isAdmin() || (roomId == 'support_' + request.auth.uid && hasActiveProfile()));
+        allow delete: if isAdmin() && roomId == 'students';
+      }
+    }
+
+    match /chatSettings/{settingId} {
+      allow get: if settingId == 'group' && (isAdmin() || hasActiveProfile());
+      allow list: if false;
+      allow create: if isAdmin()
+        && settingId == 'group'
+        && request.resource.data.keys().hasOnly(['locked', 'updatedAt', 'updatedBy'])
+        && request.resource.data.keys().hasAll(['locked', 'updatedAt', 'updatedBy'])
+        && request.resource.data.locked is bool
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.updatedBy == request.auth.uid;
+      allow update: if isAdmin()
+        && settingId == 'group'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'locked', 'updatedAt', 'updatedBy'
+        ])
+        && request.resource.data.keys().hasOnly(['locked', 'updatedAt', 'updatedBy'])
+        && request.resource.data.keys().hasAll(['locked', 'updatedAt', 'updatedBy'])
+        && request.resource.data.locked is bool
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.updatedBy == request.auth.uid;
+      allow delete: if false;
+    }
+
+    match /announcements/{announcementId} {
+      allow read: if isAdmin() || (hasActiveProfile() && resource.data.hidden != true);
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+          'title', 'body', 'createdAt', 'createdBy', 'hidden'
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 120
+        && request.resource.data.body is string
+        && request.resource.data.body.size() > 0
+        && request.resource.data.body.size() <= 3000
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.hidden is bool;
+      allow update, delete: if isAdmin();
+      match /seen/{uid} {
+        allow read: if isSelf(uid) || isAdmin();
+        allow create: if isSelf(uid) && hasActiveProfile()
+          && request.resource.data.keys().hasOnly(['seenAt']);
+        allow update, delete: if false;
+      }
+    }
+
+    match /publicStats/{statId} {
+      allow get: if signedIn() && statId == 'catalog';
+      allow list: if false;
+      allow create: if (isAdmin()
+        && statId == 'catalog'
+        && request.resource.data.keys().hasOnly(['courseCount', 'studentCount', 'updatedAt'])
+        && request.resource.data.courseCount is int
+        && request.resource.data.courseCount >= 0
+        && request.resource.data.studentCount is int
+        && request.resource.data.studentCount >= 0
+        && request.resource.data.updatedAt == request.time)
+        || validStudentCounterCreate(statId);
+      allow update: if (isAdmin()
+        && statId == 'catalog'
+        && request.resource.data.keys().hasOnly(['courseCount', 'studentCount', 'updatedAt'])
+        && request.resource.data.courseCount is int
+        && request.resource.data.courseCount >= 0
+        && request.resource.data.studentCount is int
+        && request.resource.data.studentCount >= 0
+        && request.resource.data.updatedAt == request.time)
+        || validStudentCounterIncrement(statId);
+      allow delete: if false;
+    }
+
+    match /devices/{uid}/sessions/{deviceId} {
+      allow read: if isSelf(uid) || isAdmin();
+      allow write: if false;
+    }
+    match /phoneNumbers/{phone} {
+      allow get: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow list: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && !exists(/databases/$(database)/documents/phoneNumbers/$(phone))
+        && getAfter(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.phone == phone;
+      allow update, delete: if false;
+    }
+    match /profileNames/{nameKey} {
+      allow get: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow list: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid
+        && !exists(/databases/$(database)/documents/profileNames/$(nameKey))
+        && getAfter(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.normalizedName == nameKey;
+      allow update, delete: if false;
+    }
+    match /referralCodes/{code} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid
+        && !exists(/databases/$(database)/documents/referralCodes/$(code))
+        && getAfter(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.studentCode == code;
+      allow update, delete: if false;
+    }
+    match /deviceRequests/{requestId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow write: if false;
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
