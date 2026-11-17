@@ -36,6 +36,11 @@ import {
   writeBatch,
 } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
 import { getFirestore } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
+import {
+  connectFunctionsEmulator,
+  getFunctions,
+  httpsCallable,
+} from "https://www.gstatic.com/firebasejs/11.10.0/firebase-functions.js";
 import { adminUids, firebaseConfig } from "./firebase-config.js";
 
 const useEmulators = ["localhost", "127.0.0.1"].includes(location.hostname)
@@ -50,10 +55,13 @@ const app = initializeApp(useEmulators
   : firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+const functions = getFunctions(app);
 if (useEmulators) {
   connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
   connectFirestoreEmulator(db, "127.0.0.1", 8080);
+  connectFunctionsEmulator(functions, "127.0.0.1", 5001);
 }
+const translateLessonContent = httpsCallable(functions, "translateLessonContent");
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 const root = document.querySelector("#root");
@@ -91,6 +99,10 @@ const state = {
   selectedCourse: null,
   selectedChapterId: "",
   selectedLesson: null,
+  translatedLesson: null,
+  translationLoading: false,
+  translationError: "",
+  translationRequestVersion: 0,
   chatMessages: [],
   supportRooms: [],
   supportRoom: null,
@@ -350,6 +362,42 @@ function courseAudienceKeys(course) {
   const expandedTracks = filters.tracks.includes("كلاهما") ? tracks : filters.tracks;
   return filters.grades.flatMap((grade) =>
     expandedTracks.map((track) => `${grade}|${track}`));
+}
+
+function canTranslateLesson(lesson) {
+  return !state.admin
+    && state.profile?.track === "لغات"
+    && state.selectedCourse?.translationEnabled !== false
+    && lesson?.translationEnabled !== false;
+}
+
+async function loadLessonTranslation(lesson) {
+  const requestVersion = ++state.translationRequestVersion;
+  state.translatedLesson = null;
+  state.translationError = "";
+  state.translationLoading = canTranslateLesson(lesson);
+  if (!state.translationLoading) {
+    render();
+    return;
+  }
+  render();
+  try {
+    const result = await translateLessonContent({ lessonId: lesson.id });
+    if (requestVersion !== state.translationRequestVersion
+      || state.selectedLesson?.id !== lesson.id) return;
+    state.translatedLesson = { id: lesson.id, ...result.data };
+  } catch (error) {
+    console.error(`Could not translate lesson ${lesson.id}.`, error);
+    if (requestVersion === state.translationRequestVersion
+      && state.selectedLesson?.id === lesson.id) {
+      state.translationError = error?.message || "تعذرت ترجمة المحتوى.";
+    }
+  } finally {
+    if (requestVersion === state.translationRequestVersion) {
+      state.translationLoading = false;
+      render();
+    }
+  }
 }
 
 function allAudienceKeys() {
@@ -825,11 +873,20 @@ function listenSharedData() {
       syncPublicStats();
     }
     if (state.selectedCourse) {
-      state.selectedCourse = state.courses.find((course) => course.id === state.selectedCourse.id) || null;
+      const previousCourse = state.selectedCourse;
+      state.selectedCourse = state.courses.find((course) => course.id === previousCourse.id) || null;
       if (!state.selectedCourse) {
         state.selectedChapterId = "";
         state.selectedLesson = null;
+        state.translationRequestVersion += 1;
+        state.translatedLesson = null;
+        state.translationLoading = false;
+        state.translationError = "";
         listenLessons(null);
+      } else if ((previousCourse.translationEnabled !== false)
+        !== (state.selectedCourse.translationEnabled !== false)
+        && state.selectedLesson) {
+        loadLessonTranslation(state.selectedLesson).catch(fail);
       }
     }
     render();
@@ -928,7 +985,26 @@ function listenLessons(course) {
     if (lessonSubscriptionCourseId !== course.id || lessonSubscriptionVersion !== subscriptionVersion) return;
     state.lessons = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
     if (state.selectedLesson) {
-      state.selectedLesson = state.lessons.find((item) => item.id === state.selectedLesson.id) || null;
+      const previousLesson = state.selectedLesson;
+      state.selectedLesson = state.lessons.find((item) => item.id === previousLesson.id) || null;
+      if (!state.selectedLesson) {
+        state.translationRequestVersion += 1;
+        state.translatedLesson = null;
+        state.translationLoading = false;
+        state.translationError = "";
+      } else if (JSON.stringify([
+        previousLesson.title,
+        previousLesson.chapterTitle,
+        previousLesson.translationEnabled,
+        previousLesson.entries,
+      ]) !== JSON.stringify([
+        state.selectedLesson.title,
+        state.selectedLesson.chapterTitle,
+        state.selectedLesson.translationEnabled,
+        state.selectedLesson.entries,
+      ])) {
+        loadLessonTranslation(state.selectedLesson).catch(fail);
+      }
     }
     if (state.admin) {
       const currentCourse = state.courses.find((item) => item.id === course.id);
@@ -1498,11 +1574,20 @@ function lessonView() {
     || state.chapters.find((item) =>
       Number(item.number) === Number(lesson.chapterNumber)
       && (item.type === (lesson.type === "exam" ? "exam" : "chapter") || item.type === "chapter"));
-  const entries = lesson.entries || [];
+  const translation = state.translatedLesson?.id === lesson.id ? state.translatedLesson : null;
+  const entries = translation?.entries || lesson.entries || [];
+  const lessonTitle = translation?.title || lesson.title;
+  const chapterTitle = translation?.chapterTitle || chapter?.title || lesson.chapterTitle;
   const position = state.lessons.findIndex((item) => item.id === lesson.id);
-  return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-lessons">${h(state.selectedCourse?.title || "")}</button> ← <b>${h(lesson.title)}</b>${state.admin ? `<button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل الدرس</button>` : ""}</div>
-    <div class="lesson-heading"><div class="lesson-symbol">▤</div><div><span class="eyebrow">${lesson.type === "exam" ? "مراجعة واختبار" : h(chapter?.title || lesson.chapterTitle || `الفصل ${lesson.chapterNumber}`)}</span><h1>${h(lesson.title)}</h1></div><span class="pill">${entries.length} سؤال</span></div>
-    <div class="qa-list">${entries.map((entry, index) => `<article class="qa-card"><div class="qa-number">س${String(index + 1).padStart(2, "0")}</div><div class="qa-body"><h3>${h(entry.question)}</h3><div class="answer-box"><span>الإجابة</span><p>${h(entry.answer)}</p></div></div><button class="copy-button" data-copy="${h(entry.answer)}"><span>▣</span><span>نسخ</span></button></article>`).join("")}</div>
+  const translationStatus = state.translationLoading
+    ? `<div class="support-status" role="status">جارٍ تجهيز النسخة الإنجليزية...</div>`
+    : state.translationError
+      ? `<div class="inline-error" role="alert">${h(state.translationError)} <button class="text-button" data-action="retry-lesson-translation">إعادة المحاولة</button></div>`
+      : "";
+  return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-lessons">${h(state.selectedCourse?.title || "")}</button> ← <b>${h(lessonTitle)}</b>${state.admin ? `<button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل الدرس</button>` : ""}</div>
+    ${translationStatus}
+    <div class="lesson-heading"><div class="lesson-symbol">▤</div><div><span class="eyebrow">${lesson.type === "exam" ? "مراجعة واختبار" : h(chapterTitle || `الفصل ${lesson.chapterNumber}`)}</span><h1>${h(lessonTitle)}</h1></div><span class="pill">${entries.length} سؤال</span></div>
+    <div class="qa-list">${entries.map((entry, index) => `<article class="qa-card"><div class="qa-number">س${String(index + 1).padStart(2, "0")}</div><div class="qa-body" dir="${translation ? "ltr" : "rtl"}"><h3>${h(entry.question)}</h3><div class="answer-box"><span>الإجابة</span><p>${h(entry.answer)}</p></div></div><button class="copy-button" data-copy="${h(entry.answer)}"><span>▣</span><span>نسخ</span></button></article>`).join("")}</div>
     <div class="lesson-next"><span>✓✓ ${position === state.lessons.length - 1 ? "أنهيت آخر محتوى في هذه المنصة" : "أحسنت! أكملت هذا المحتوى"}</span><button class="button button-primary" data-action="next-lesson">${position === state.lessons.length - 1 ? "إنهاء" : "التالي"} ←</button></div></div>`;
 }
 
@@ -1628,7 +1713,7 @@ function modalView() {
     const courseFilters = courseAudienceFilters(editing ? course : { grade: grades, track: [tracks[0]] });
     const selectedGrades = courseFilters.grades;
     const selectedTracks = courseFilters.tracks;
-    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل المنصة" : "إضافة منصة جديدة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><form class="form-grid" data-form="course"><label>اسم المنصة<input name="title" required value="${editing ? h(course.title) : ""}" placeholder="مثال: منصة الرياضيات"></label><label>وصف مختصر<input name="description" value="${editing ? h(course.description || "") : ""}" placeholder="محتوى المنصة"></label><div class="multi-check-list"><label>الصفوف المتاحة</label><div class="check-grid">${grades.map((grade) => `<label class="check-item"><input type="checkbox" name="grade" value="${h(grade)}" ${selectedGrades.includes(grade) ? "checked" : ""}> <span>${h(grade)}</span></label>`).join("")}</div></div><div class="multi-check-list"><label>المسارات المتاحة</label><div class="check-grid">${courseTrackOptions.map((track) => `<label class="check-item"><input type="checkbox" name="track" value="${h(track)}" ${selectedTracks.includes(track) ? "checked" : ""}> <span>${h(track)}</span></label>`).join("")}</div></div><button class="button button-primary" ${state.busy ? "disabled" : ""}>${editing ? "حفظ التعديلات" : "＋ إضافة المنصة"}</button></form></section></div>`;
+    return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${editing ? "تعديل المنصة" : "إضافة منصة جديدة"}</h2><button class="icon-button" data-action="close-modal">×</button></div><form class="form-grid" data-form="course"><label>اسم المنصة<input name="title" required value="${editing ? h(course.title) : ""}" placeholder="مثال: منصة الرياضيات"></label><label>وصف مختصر<input name="description" value="${editing ? h(course.description || "") : ""}" placeholder="محتوى المنصة"></label><div class="multi-check-list"><label>الصفوف المتاحة</label><div class="check-grid">${grades.map((grade) => `<label class="check-item"><input type="checkbox" name="grade" value="${h(grade)}" ${selectedGrades.includes(grade) ? "checked" : ""}> <span>${h(grade)}</span></label>`).join("")}</div></div><div class="multi-check-list"><label>المسارات المتاحة</label><div class="check-grid">${courseTrackOptions.map((track) => `<label class="check-item"><input type="checkbox" name="track" value="${h(track)}" ${selectedTracks.includes(track) ? "checked" : ""}> <span>${h(track)}</span></label>`).join("")}</div></div><label class="check-item"><input type="checkbox" name="translationEnabled" ${course?.translationEnabled === false ? "" : "checked"}><span>السماح بترجمة محتوى المنصة تلقائياً لطلاب مسار لغات</span></label><button class="button button-primary" ${state.busy ? "disabled" : ""}>${editing ? "حفظ التعديلات" : "＋ إضافة المنصة"}</button></form></section></div>`;
   }
   if (state.modal === "chapter") {
     const chapter = state.chapters.find((item) => item.id === state.editingChapterId);
@@ -1643,10 +1728,13 @@ function modalView() {
     const titleValue = lesson?.title || "";
     const typeValue = lesson?.type || "lesson";
     const entries = lesson?.entries || [];
+    const translationEnabled = lesson
+      ? lesson.translationEnabled !== false
+      : state.selectedCourse?.translationEnabled !== false;
     const inputCount = Math.min(MAX_LESSON_QUESTIONS, Math.max(3, entries.length || 3));
     return `<div class="modal-backdrop" data-action="backdrop"><section class="modal-card"><div class="modal-heading"><h2>${lesson ? "تعديل درس أو امتحان" : "إضافة درس أو امتحان"}</h2><button class="icon-button" data-action="close-modal">×</button></div><p class="muted">${h(state.selectedCourse?.title || "")}</p>${state.chapters.length ? `<form class="form-grid lesson-form" data-form="lesson">
       <label>الفصل<select name="chapterId" required>${state.chapters.map((chapter) => `<option value="${h(chapter.id)}" ${chapterId === chapter.id ? "selected" : ""}>${h(chapter.title)}</option>`).join("")}</select></label>
-      <label>اسم الدرس / الامتحان<input name="title" required placeholder="مثال: الدرس الأول" value="${h(titleValue)}"></label><label>نوع المحتوى<select name="type"><option value="lesson" ${typeValue === "lesson" ? "selected" : ""}>درس</option><option value="exam" ${typeValue === "exam" ? "selected" : ""}>امتحان</option></select></label>
+      <label>اسم الدرس / الامتحان<input name="title" required placeholder="مثال: الدرس الأول" value="${h(titleValue)}"></label><label>نوع المحتوى<select name="type"><option value="lesson" ${typeValue === "lesson" ? "selected" : ""}>درس</option><option value="exam" ${typeValue === "exam" ? "selected" : ""}>امتحان</option></select></label><label class="check-item"><input type="checkbox" name="translationEnabled" ${translationEnabled ? "checked" : ""}><span>السماح بترجمة محتوى هذا الدرس أو الامتحان تلقائياً</span></label>
       <div class="question-fields">${Array.from({ length: inputCount }, (_, index) => questionFields(index, entries[index]?.question || "", entries[index]?.answer || "")).join("")}</div>
       <button type="button" class="text-button" data-action="add-question" ${inputCount >= MAX_LESSON_QUESTIONS || state.busy ? "disabled" : ""}>＋ إضافة سؤال</button><button class="button button-primary" ${state.busy ? "disabled" : ""}>${lesson ? "حفظ التعديلات" : "حفظ المحتوى"}</button></form>` : `<div class="empty-state"><p>أنشئ فصلاً أولاً، ثم أضف الدروس والامتحانات بداخله.</p><button class="button button-primary" data-action="add-chapter">＋ إضافة فصل</button></div>`}</section></div>`;
   }
@@ -1879,6 +1967,7 @@ async function handleSubmit(event) {
             grade: gradeValue,
             track: trackValue,
             audienceKeys,
+            translationEnabled: data.translationEnabled === "on",
           };
           await saveCourseAudienceCopies(existingCourse, courseData);
           if (state.selectedCourse?.id === state.editingCourseId) {
@@ -1895,6 +1984,7 @@ async function handleSubmit(event) {
             grade: gradeValue,
             track: trackValue,
             audienceKeys,
+            translationEnabled: data.translationEnabled === "on",
             createdAt: serverTimestamp(),
           });
           notice = "تمت إضافة المنصة بنجاح.";
@@ -1975,6 +2065,7 @@ async function handleSubmit(event) {
           title,
           type: data.type,
           entries,
+          translationEnabled: data.translationEnabled === "on",
           sortOrder: existingLesson
             ? Number(existingLesson.sortOrder ?? Date.now())
             : Date.now(),
@@ -1994,18 +2085,23 @@ async function handleSubmit(event) {
         state.modal = "";
         break;
       }
-      case "school-info":
+      case "school-info": {
         if (!grades.includes(String(data.grade)) || !tracks.includes(String(data.track))) {
           throw new Error("اختر الصف والمسار الدراسيين.");
         }
+        const trackChanged = state.profile.track !== data.track;
         await updateDoc(doc(db, "profiles", state.user.uid), {
           grade: data.grade,
           track: data.track,
         });
         state.profile = { ...state.profile, grade: data.grade, track: data.track };
+        if (trackChanged && state.selectedLesson) {
+          await loadLessonTranslation(state.selectedLesson);
+        }
         state.modal = "";
         notify("تم تحديث الصف والمسار الدراسي.");
         break;
+      }
       case "announcement": {
         const title = String(data.title || "").trim();
         const body = String(data.body || "").trim();
@@ -2487,11 +2583,21 @@ async function clickAction(action, target, originalTarget) {
     }
     case "back-courses":
       state.selectedCourse = null; state.selectedChapterId = ""; state.selectedLesson = null; listenLessons(null); render(); break;
-    case "back-lessons": state.selectedLesson = null; render(); break;
+    case "back-lessons":
+      state.selectedLesson = null;
+      state.translationRequestVersion += 1;
+      state.translatedLesson = null;
+      state.translationLoading = false;
+      state.translationError = "";
+      render();
+      break;
+    case "retry-lesson-translation":
+      if (state.selectedLesson) await loadLessonTranslation(state.selectedLesson);
+      break;
     case "next-lesson": {
       const index = state.lessons.findIndex((lesson) => lesson.id === state.selectedLesson?.id);
       state.selectedLesson = state.lessons[index + 1] || null;
-      render();
+      await loadLessonTranslation(state.selectedLesson);
       break;
     }
     default: break;
@@ -2604,7 +2710,7 @@ async function handleClick(event) {
   const lessonButton = event.target.closest(".lesson-row[data-lesson]");
   if (lessonButton) {
     state.selectedLesson = state.lessons.find((lesson) => lesson.id === lessonButton.dataset.lesson) || null;
-    render();
+    await loadLessonTranslation(state.selectedLesson);
     return;
   }
   const copyButton = event.target.closest("[data-copy]");
