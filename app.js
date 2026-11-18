@@ -92,10 +92,6 @@ const state = {
   selectedChapterId: "",
   selectedLesson: null,
   translatedLesson: null,
-  translationLoading: false,
-  translationError: "",
-  translationCanRetry: false,
-  translationStatus: "",
   translationRequestVersion: 0,
   chatMessages: [],
   supportRooms: [],
@@ -121,7 +117,6 @@ const state = {
 
 const unsubscribers = new Map();
 const localLessonTranslations = new Map();
-let localArabicEnglishTranslatorPromise = null;
 let sharedDataSubscriptionKey = null;
 let lessonSubscriptionCourseId = null;
 let lessonSubscriptionVersion = 0;
@@ -367,29 +362,92 @@ function canTranslateLesson(lesson) {
     && lesson?.translationEnabled !== false;
 }
 
-function createLocalArabicEnglishTranslator() {
-  const translatorApi = globalThis.Translator;
-  if (!translatorApi || typeof translatorApi.create !== "function") {
-    throw new Error("الترجمة المحلية غير مدعومة في هذا المتصفح. استخدم أحدث إصدار من Chrome على الكمبيوتر.");
+const LOCAL_CODE_SAMPLE_PATTERN = /```[\s\S]*?```|`[^`]*`|\b(?:console(?:\.[A-Za-z_$][\w$]*)*|print|input|prompt|alert)\s*\([^)]*\)/gu;
+const LOCAL_TRANSLATION_PAIRS = [
+  ["إجابة", "answer"], ["الإجابة", "the answer"], ["سؤال", "question"], ["السؤال", "the question"],
+  ["اختر الإجابة الصحيحة", "choose the correct answer"], ["اختر", "choose"], ["الصحيح", "correct"],
+  ["ما هو", "what is"], ["ما هي", "what is"], ["ما يلي", "the following"], ["أي مما يلي", "which of the following"],
+  ["أكمل الفراغات", "fill in the blanks"], ["صح أم خطأ", "true or false"], ["الإجابة هي", "the answer is"],
+  ["اكتب برنامج", "write a program"], ["اكتب", "write"], ["أوجد قيمة", "find the value"], ["أوجد", "find"],
+  ["احسب قيمة", "calculate the value"], ["احسب", "calculate"], ["اطبع النتيجة", "print the result"],
+  ["اطبع", "print"], ["أدخل", "enter"], ["النتيجة", "the result"], ["قيمة", "value"],
+  ["برنامج", "program"], ["البرنامج", "the program"], ["متغير", "variable"], ["المتغير", "the variable"],
+  ["دالة", "function"], ["الدالة", "the function"], ["حلقة", "loop"], ["شرط", "condition"],
+  ["مصفوفة", "array"], ["نص", "string"], ["رقم", "number"], ["عدد", "number"], ["حرف", "character"],
+  ["إدخال", "input"], ["إخراج", "output"], ["ملف", "file"], ["قائمة", "list"], ["عنصر", "item"],
+  ["مجموع", "sum"], ["المجموع", "the sum"], ["أكبر", "greater"], ["أصغر", "less"],
+  ["يساوي", "equals"], ["يساوي", "equal"], ["إذا", "if"], ["وإلا", "otherwise"],
+  ["ثم", "then"], ["أو", "or"], ["ليس", "not"], ["نعم", "yes"], ["لا", "no"],
+  ["صحيح", "true"], ["خطأ", "false"], ["من", "from"], ["إلى", "to"], ["في", "in"],
+  ["على", "on"], ["مع", "with"], ["قبل", "before"], ["بعد", "after"], ["كل", "each"],
+  ["الأول", "first"], ["الثاني", "second"], ["الثالث", "third"], ["التالي", "next"],
+  ["السابق", "previous"], ["مرحبا", "hello"], ["شكرا", "thank you"], ["لغة", "language"],
+  ["اللغة", "the language"], ["برمجة", "programming"], ["البرمجة", "programming"],
+  ["تعلم", "learn"], ["استخدم", "use"], ["يحتوي", "contains"], ["يسمى", "called"],
+  ["هو", "is"], ["هي", "is"], ["يكون", "be"], ["تكون", "be"],
+  ["what is", "ما هو"], ["what are", "ما هي"], ["which of the following", "أي مما يلي"],
+  ["ما الإجابة", "what is the answer"], ["ما الناتج", "what is the output"],
+  ["ماذا يطبع هذا البرنامج", "what does this program print"],
+  ["choose the correct answer", "اختر الإجابة الصحيحة"], ["the answer is", "الإجابة هي"],
+  ["write a program", "اكتب برنامج"], ["find the value", "أوجد قيمة"], ["calculate the value", "احسب قيمة"],
+  ["print the result", "اطبع النتيجة"], ["true or false", "صح أم خطأ"], ["fill in the blanks", "أكمل الفراغات"],
+];
+
+function normalizeTranslationWord(word) {
+  return word.toLocaleLowerCase("en")
+    .replace(/[\u064b-\u065f\u0670]/gu, "")
+    .replace(/[أإآ]/gu, "ا");
+}
+
+function createTranslationDictionary(sourceIndex, targetIndex) {
+  const words = new Map();
+  const phrases = [];
+  for (const pair of LOCAL_TRANSLATION_PAIRS) {
+    const source = pair[sourceIndex];
+    const target = pair[targetIndex];
+    if (source.includes(" ")) phrases.push([source, target]);
+    else words.set(normalizeTranslationWord(source), target);
   }
-  if (!localArabicEnglishTranslatorPromise) {
-    localArabicEnglishTranslatorPromise = translatorApi.create({
-      sourceLanguage: "ar",
-      targetLanguage: "en",
-      monitor(monitor) {
-        monitor.addEventListener("downloadprogress", (event) => {
-          if (!state.translationLoading) return;
-          const progress = Math.round(event.loaded * 100);
-          state.translationStatus = `جارٍ تنزيل نموذج الترجمة على جهازك ${progress}%...`;
-          render();
-        });
-      },
-    }).catch((error) => {
-      localArabicEnglishTranslatorPromise = null;
-      throw error;
-    });
+  phrases.sort((first, second) => second[0].length - first[0].length);
+  return { words, phrases };
+}
+
+const localTranslationDictionaries = {
+  "ar-en": createTranslationDictionary(0, 1),
+  "en-ar": createTranslationDictionary(1, 0),
+};
+
+function translateTextLocally(text, direction) {
+  const dictionary = localTranslationDictionaries[direction];
+  let translated = String(text || "");
+  const preservedCode = [];
+  translated = translated.replace(
+    LOCAL_CODE_SAMPLE_PATTERN,
+    (snippet) => `\uE000${preservedCode.push(snippet) - 1}\uE001`,
+  );
+  for (const [source, target] of dictionary.phrases) {
+    const escapedSource = source.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const phrasePattern = new RegExp(
+      `(^|[^\\p{L}\\p{M}\\p{N}])${escapedSource}(?=$|[^\\p{L}\\p{M}\\p{N}])`,
+      "giu",
+    );
+    translated = translated.replace(phrasePattern, (_match, prefix) => `${prefix}${target}`);
   }
-  return localArabicEnglishTranslatorPromise;
+  translated = translated.replace(/[\p{L}\p{M}\p{N}]+/gu, (word) => (
+    dictionary.words.get(normalizeTranslationWord(word)) || word
+  ));
+  return translated.replace(/\uE000(\d+)\uE001/gu, (_match, index) => preservedCode[Number(index)]);
+}
+
+function lessonTranslationDirection(lesson) {
+  const texts = [
+    lesson.title,
+    lesson.chapterTitle,
+    ...(lesson.entries || []).flatMap((entry) => [entry.question, entry.answer]),
+  ].map((text) => String(text || "")).join(" ").replace(LOCAL_CODE_SAMPLE_PATTERN, "");
+  const arabicLetters = (texts.match(/[\u0600-\u06ff]/gu) || []).length;
+  const englishLetters = (texts.match(/[a-z]/giu) || []).length;
+  return arabicLetters >= englishLetters ? "ar-en" : "en-ar";
 }
 
 function lessonTranslationSource(lesson) {
@@ -401,33 +459,16 @@ function lessonTranslationSource(lesson) {
   ]);
 }
 
-function lessonHasArabicText(lesson) {
-  return [
-    lesson.title,
-    lesson.chapterTitle,
-    ...(lesson.entries || []).flatMap((entry) => [entry.question, entry.answer]),
-  ].some((text) => /[\u0600-\u06ff]/u.test(String(text || "")));
-}
-
-async function translateLessonLocally(lesson, translator, requestVersion) {
+function translateLessonLocally(lesson, direction) {
   const entries = lesson.entries || [];
   const texts = [
     lesson.title || "",
     lesson.chapterTitle || "",
     ...entries.flatMap((entry) => [entry.question || "", entry.answer || ""]),
   ];
-  const translatedTexts = [];
-  for (let index = 0; index < texts.length; index += 1) {
-    if (requestVersion !== state.translationRequestVersion) return null;
-    const text = String(texts[index]);
-    translatedTexts.push(/[\u0600-\u06ff]/u.test(text) ? await translator.translate(text) : text);
-    if (index % 5 === 4 || index === texts.length - 1) {
-      const progress = Math.round(((index + 1) / texts.length) * 100);
-      state.translationStatus = `جارٍ ترجمة المحتوى على جهازك ${progress}%...`;
-      render();
-    }
-  }
+  const translatedTexts = texts.map((text) => translateTextLocally(text, direction));
   return {
+    direction: direction === "ar-en" ? "ltr" : "rtl",
     title: translatedTexts[0],
     chapterTitle: translatedTexts[1],
     entries: entries.map((entry, index) => ({
@@ -441,74 +482,24 @@ async function translateLessonLocally(lesson, translator, requestVersion) {
 async function loadLessonTranslation(lesson) {
   const requestVersion = ++state.translationRequestVersion;
   state.translatedLesson = null;
-  state.translationError = "";
-  state.translationCanRetry = false;
-  state.translationStatus = "";
-  state.translationLoading = canTranslateLesson(lesson);
-  if (!state.translationLoading) {
+  if (!canTranslateLesson(lesson)) {
     render();
     return;
   }
   const source = lessonTranslationSource(lesson);
   const cached = localLessonTranslations.get(source);
-  if (cached) {
-    state.translatedLesson = { id: lesson.id, ...cached };
-    state.translationLoading = false;
-    render();
-    return;
-  }
-  if (!lessonHasArabicText(lesson)) {
-    const translation = {
-      title: lesson.title || "",
-      chapterTitle: lesson.chapterTitle || "",
-      entries: lesson.entries || [],
-    };
+  const translation = cached || translateLessonLocally(lesson, lessonTranslationDirection(lesson));
+  if (requestVersion === state.translationRequestVersion
+    && state.selectedLesson?.id === lesson.id) {
     state.translatedLesson = { id: lesson.id, ...translation };
-    localLessonTranslations.set(source, translation);
-    state.translationLoading = false;
-    render();
-    return;
-  }
-  let translatorPromise;
-  try {
-    translatorPromise = createLocalArabicEnglishTranslator();
-    state.translationStatus = "جارٍ تجهيز الترجمة المحلية على جهازك...";
-  } catch (error) {
-    state.translationError = error.message || "تعذرت تهيئة الترجمة المحلية.";
-    state.translationCanRetry = typeof globalThis.Translator?.create === "function";
-    state.translationLoading = false;
-    render();
-    return;
+    if (!cached) {
+      localLessonTranslations.set(source, translation);
+      if (localLessonTranslations.size > 20) {
+        localLessonTranslations.delete(localLessonTranslations.keys().next().value);
+      }
+    }
   }
   render();
-  try {
-    const translator = await translatorPromise;
-    if (requestVersion !== state.translationRequestVersion
-      || state.selectedLesson?.id !== lesson.id) return;
-    const translation = await translateLessonLocally(lesson, translator, requestVersion);
-    if (!translation
-      || requestVersion !== state.translationRequestVersion
-      || state.selectedLesson?.id !== lesson.id) return;
-    state.translatedLesson = { id: lesson.id, ...translation };
-    localLessonTranslations.set(source, translation);
-    state.translationCanRetry = false;
-    if (localLessonTranslations.size > 20) {
-      localLessonTranslations.delete(localLessonTranslations.keys().next().value);
-    }
-  } catch (error) {
-    console.error("Could not translate lesson locally.", error);
-    if (requestVersion === state.translationRequestVersion
-      && state.selectedLesson?.id === lesson.id) {
-      state.translationError = "تعذرت الترجمة المحلية. تحقق من اتصالك لتنزيل نموذج المتصفح، ثم أعد المحاولة.";
-      state.translationCanRetry = true;
-    }
-  } finally {
-    if (requestVersion === state.translationRequestVersion) {
-      state.translationLoading = false;
-      state.translationStatus = "";
-      render();
-    }
-  }
 }
 
 function allAudienceKeys() {
@@ -991,10 +982,6 @@ function listenSharedData() {
         state.selectedLesson = null;
         state.translationRequestVersion += 1;
         state.translatedLesson = null;
-        state.translationLoading = false;
-        state.translationError = "";
-        state.translationCanRetry = false;
-        state.translationStatus = "";
         listenLessons(null);
       } else if ((previousCourse.translationEnabled !== false)
         !== (state.selectedCourse.translationEnabled !== false)
@@ -1103,10 +1090,6 @@ function listenLessons(course) {
       if (!state.selectedLesson) {
         state.translationRequestVersion += 1;
         state.translatedLesson = null;
-        state.translationLoading = false;
-        state.translationError = "";
-        state.translationCanRetry = false;
-        state.translationStatus = "";
       } else if (JSON.stringify([
         previousLesson.title,
         previousLesson.chapterTitle,
@@ -1694,15 +1677,10 @@ function lessonView() {
   const lessonTitle = translation?.title || lesson.title;
   const chapterTitle = translation?.chapterTitle || chapter?.title || lesson.chapterTitle;
   const position = state.lessons.findIndex((item) => item.id === lesson.id);
-  const translationStatus = state.translationLoading
-    ? `<div class="support-status" role="status">${h(state.translationStatus || "جارٍ تجهيز النسخة الإنجليزية على جهازك...")}</div>`
-    : state.translationError
-      ? `<div class="inline-error" role="alert">${h(state.translationError)}${state.translationCanRetry ? ` <button class="text-button" data-action="retry-lesson-translation">إعادة المحاولة</button>` : ""}</div>`
-      : "";
-  return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-lessons">${h(state.selectedCourse?.title || "")}</button> ← <b dir="${translation ? "ltr" : "rtl"}">${h(lessonTitle)}</b>${state.admin ? `<button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل الدرس</button>` : ""}</div>
-    ${translationStatus}
-    <div class="lesson-heading"><div class="lesson-symbol">▤</div><div><span class="eyebrow" dir="${translation ? "ltr" : "rtl"}">${lesson.type === "exam" ? "مراجعة واختبار" : h(chapterTitle || `الفصل ${lesson.chapterNumber}`)}</span><h1 dir="${translation ? "ltr" : "rtl"}">${h(lessonTitle)}</h1></div><span class="pill">${entries.length} سؤال</span></div>
-    <div class="qa-list">${entries.map((entry, index) => `<article class="qa-card"><div class="qa-number">س${String(index + 1).padStart(2, "0")}</div><div class="qa-body" dir="${translation ? "ltr" : "rtl"}"><h3>${h(entry.question)}</h3><div class="answer-box"><span>${translation ? "Answer" : "الإجابة"}</span><p>${h(entry.answer)}</p></div></div><button class="copy-button" data-copy="${h(entry.answer)}"><span>▣</span><span>نسخ</span></button></article>`).join("")}</div>
+  const textDirection = translation?.direction || "rtl";
+  return `<div class="learning-page"><div class="learning-breadcrumb"><button class="text-button" data-action="back-lessons">${h(state.selectedCourse?.title || "")}</button> ← <b dir="${textDirection}">${h(lessonTitle)}</b>${state.admin ? `<button class="text-button danger" data-action="edit-lesson" data-lesson="${h(lesson.id)}">تعديل الدرس</button>` : ""}</div>
+    <div class="lesson-heading"><div class="lesson-symbol">▤</div><div><span class="eyebrow" dir="${textDirection}">${lesson.type === "exam" ? "مراجعة واختبار" : h(chapterTitle || `الفصل ${lesson.chapterNumber}`)}</span><h1 dir="${textDirection}">${h(lessonTitle)}</h1></div><span class="pill">${entries.length} سؤال</span></div>
+    <div class="qa-list">${entries.map((entry, index) => `<article class="qa-card"><div class="qa-number">س${String(index + 1).padStart(2, "0")}</div><div class="qa-body" dir="${textDirection}"><h3>${h(entry.question)}</h3><div class="answer-box"><span>${textDirection === "ltr" ? "Answer" : "الإجابة"}</span><p>${h(entry.answer)}</p></div></div><button class="copy-button" data-copy="${h(entry.answer)}"><span>▣</span><span>نسخ</span></button></article>`).join("")}</div>
     <div class="lesson-next"><span>✓✓ ${position === state.lessons.length - 1 ? "أنهيت آخر محتوى في هذه المنصة" : "أحسنت! أكملت هذا المحتوى"}</span><button class="button button-primary" data-action="next-lesson">${position === state.lessons.length - 1 ? "إنهاء" : "التالي"} ←</button></div></div>`;
 }
 
@@ -2702,14 +2680,7 @@ async function clickAction(action, target, originalTarget) {
       state.selectedLesson = null;
       state.translationRequestVersion += 1;
       state.translatedLesson = null;
-      state.translationLoading = false;
-      state.translationError = "";
-      state.translationCanRetry = false;
-      state.translationStatus = "";
       render();
-      break;
-    case "retry-lesson-translation":
-      if (state.selectedLesson) await loadLessonTranslation(state.selectedLesson);
       break;
     case "next-lesson": {
       const index = state.lessons.findIndex((lesson) => lesson.id === state.selectedLesson?.id);
